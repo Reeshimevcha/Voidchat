@@ -1,3 +1,4 @@
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyBph8A8njpDLIwE9JfB_Yr7j9CdKvKqDQA",
   authDomain: "voidchat-72ed4.firebaseapp.com",
@@ -7,4 +8,5 @@ const firebaseConfig = {
   appId: "1:355987303332:web:a516052ee354afa174ef31",
   measurementId: "G-7EFMT3C0K0"
   databaseURL: "https://voidchat-72ed4-default-rtdb.asia-southeast1.firebasedatabase.app"
+
 };
