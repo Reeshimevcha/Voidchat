@@ -12,7 +12,7 @@
 
 <!-- ══════════════════════════ LANDING ══════════════════════════ -->
 <div id="screen-landing" class="screen active">
-  <div class="particles"><span></span><span></span><span></span><span></span><span></span><span></span></div>
+  <div class="particles"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
   <div class="hc tl"></div><div class="hc tr"></div><div class="hc bl"></div><div class="hc br"></div>
 
   <div class="land-wrap">
@@ -60,7 +60,7 @@
           <input class="fi" id="username-join" type="text" placeholder="Enter alias..." maxlength="20" autocomplete="off"></div>
         <div class="field"><label class="fl">CHANNEL ACCESS CODE</label>
           <input class="fi code-fi" id="room-code-join" type="text" placeholder="X7KQ2M" maxlength="6" autocomplete="off" oninput="this.value=this.value.toUpperCase()"></div>
-        <div class="info-box"><span>ℹ</span><span>You join encrypted. Messages appear as short emoji codes until the owner grants read access.</span></div>
+        <div class="info-box"><span>ℹ</span><span>You join encrypted. Messages appear as emoji cipher until revealed.</span></div>
         <button class="btn-prim" id="btn-join">▶ CONNECT TO CHANNEL</button>
       </div>
     </div>
@@ -103,7 +103,7 @@
 
     <div id="owner-perm-panel" class="hidden sb-sect">
       <div class="sb-stitle">ACCESS CONTROL</div>
-      <p class="perm-sub">Toggle per-operator read/download:</p>
+      <p class="perm-sub">Toggle per-operator download:</p>
       <div id="owner-perm-list" class="perm-list"></div>
     </div>
 
@@ -122,9 +122,13 @@
       <div class="enc-status"><div class="enc-dot"></div>ROTATING CIPHER ACTIVE</div>
     </div>
 
+    <!-- Canary status bar -->
+    <div id="canary-status" class="hidden canary-bar sb-sect"></div>
+
     <div class="sb-footer">
       <button class="sbf-btn btn-perm hidden" id="btn-permissions">🛡 ACCESS CONTROL</button>
       <button class="sbf-btn btn-privacy" id="btn-my-privacy">👁 MY PRIVACY</button>
+      <button class="sbf-btn btn-canary hidden" id="btn-plant-canary">🐦 PLANT CANARY</button>
       <button class="sbf-btn btn-call hidden" id="btn-voice-call">📞 VOICE CALL</button>
       <button class="sbf-btn btn-dl hidden" id="btn-download-chat">⬇ DOWNLOAD</button>
       <button class="sbf-btn btn-leave" id="btn-leave">↩ DISCONNECT</button>
@@ -141,10 +145,21 @@
         <span class="ch-code" id="chat-room-code">——</span>
       </div>
       <div class="ch-right">
+        <button class="btn-search-hd" id="btn-search" title="Search messages">🔍</button>
         <div class="sig-bars"><span></span><span></span><span></span><span></span></div>
         <span class="enc-pill">🔒</span>
       </div>
     </header>
+
+    <!-- PINNED MESSAGE BAR -->
+    <div id="pinned-bar" class="hidden pinned-bar">
+      <span class="pin-icon">📌</span>
+      <div class="pin-content">
+        <span class="pin-sender" id="pinned-sender"></span>
+        <span class="pin-preview" id="pinned-preview"></span>
+      </div>
+      <button class="btn-unpin" id="btn-unpin" title="Unpin">✕</button>
+    </div>
 
     <!-- Call panel -->
     <div id="call-panel" class="hidden call-panel">
@@ -174,8 +189,7 @@
       </div>
     </div>
 
-    <!-- BUILDERS (shown above input when active) -->
-    <!-- Poll builder -->
+    <!-- BUILDERS -->
     <div id="poll-builder" class="hidden builder-panel">
       <div class="bp-title">📊 CREATE POLL</div>
       <input class="fi" id="poll-question" placeholder="Poll question..." style="margin-bottom:8px">
@@ -186,7 +200,6 @@
         <button class="bp-cancel" id="btn-cancel-poll">Cancel</button>
       </div>
     </div>
-    <!-- Checklist builder -->
     <div id="check-builder" class="hidden builder-panel">
       <div class="bp-title">☑ CREATE CHECKLIST</div>
       <input class="fi" id="check-title" placeholder="Checklist title..." style="margin-bottom:8px">
@@ -197,7 +210,6 @@
         <button class="bp-cancel" id="btn-cancel-check">Cancel</button>
       </div>
     </div>
-    <!-- Contact builder -->
     <div id="contact-builder" class="hidden builder-panel">
       <div class="bp-title">👤 SHARE CONTACT</div>
       <input class="fi" id="contact-name" placeholder="Name..." style="margin-bottom:6px">
@@ -211,17 +223,24 @@
 
     <!-- INPUT AREA -->
     <div class="input-area">
-      <!-- File preview -->
       <div id="file-preview" class="hidden fp-bar">
         <span>📎</span><span id="fp-name" class="fp-nm">file</span><span id="fp-size" class="fp-sz">0</span>
         <button id="btn-clear-file" onclick="clearFile()" class="fp-x">✕</button>
       </div>
-      <!-- Rec indicator -->
       <div id="rec-indicator" class="hidden rec-bar">
         <span class="rec-dot"></span> RECORDING <span id="rec-time">0s</span>
       </div>
 
-      <!-- Popups (schedule/destruct) -->
+      <!-- REPLY BAR -->
+      <div id="reply-bar" class="hidden reply-bar">
+        <span class="reply-icon">↩</span>
+        <div class="reply-content">
+          <span class="reply-sender" id="reply-sender"></span>
+          <span class="reply-preview" id="reply-preview"></span>
+        </div>
+        <button class="fp-x" id="btn-reply-clear">✕</button>
+      </div>
+
       <div id="schedule-panel" class="hidden input-popup">
         <div class="popup-title">⏰ SCHEDULE</div>
         <input class="fi" id="sched-dt" type="datetime-local">
@@ -250,7 +269,6 @@
         </div>
       </div>
 
-      <!-- Attach menu -->
       <div id="attach-menu" class="hidden attach-menu">
         <button class="am-btn" id="attach-photo">🖼 Photo/Video</button>
         <button class="am-btn" id="attach-file">📎 File</button>
@@ -260,10 +278,8 @@
         <button class="am-btn" id="attach-contact">👤 Contact</button>
       </div>
 
-      <!-- Emoji picker -->
       <div id="emoji-picker-wrap" class="hidden emoji-picker-wrap"></div>
 
-      <!-- Main input row -->
       <div class="input-row">
         <button class="ia-btn" id="btn-attach" title="Attach">＋</button>
         <input type="file" id="file-input" style="display:none">
@@ -278,9 +294,26 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
       </div>
-      <div class="input-hint">🔐 ENCRYPTED · ＋ ATTACH · 😊 EMOJI · ⏰ SCHEDULE · 💣 TIMER · 🎙 HOLD=VOICE</div>
+      <div class="input-hint">🔐 ENCRYPTED · ＋ ATTACH · 😊 EMOJI · ⏰ SCHEDULE · 💣 TIMER · 🎙 HOLD=VOICE · ↩ REPLY</div>
     </div>
   </main>
+</div>
+
+<!-- ══════════════ SEARCH OVERLAY ══════════════ -->
+<div id="search-overlay" class="hidden search-overlay">
+  <div class="search-panel">
+    <div class="search-head">
+      <span class="search-title">🔍 MESSAGE SEARCH</span>
+      <button id="btn-close-search" class="search-close">✕</button>
+    </div>
+    <div class="search-input-wrap">
+      <span class="search-icon-inp">🔓</span>
+      <input id="search-input" class="search-fi" type="text" placeholder="Decrypt & search…" autocomplete="off">
+    </div>
+    <div id="search-results" class="search-results">
+      <div class="sr-hint">Type to decrypt and search messages…</div>
+    </div>
+  </div>
 </div>
 
 <!-- Lightbox -->
@@ -289,6 +322,7 @@
   <img class="lb-img" alt="">
   <button class="lb-close" onclick="closeLightbox()">✕</button>
 </div>
+
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
