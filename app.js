@@ -37,6 +37,7 @@ const S = {
   searchOpen:false,
   msgCache:{},             // id→{fromName,plainText} for search
   userNames:{},            // uid→name for receipt display
+  roomUsers:{},            // uid→user record (live, for privacy checks)
 };
 localStorage.setItem('vc_uid', S.uid);
 
@@ -165,8 +166,9 @@ function listenRoom(){
   const uL=uRef.on('value',snap=>{
     const users=snap.val()||{};
     renderUsers(users);
-    // Keep uid→name map for receipt tooltips
+    // Keep uid→name map for receipt tooltips, and live user records for privacy
     for(const[uid,u]of Object.entries(users)){if(u&&u.name)S.userNames[uid]=u.name;}
+    S.roomUsers=users;
     const me=users[S.uid];
     if(me){
       S.canDownload=!!me.canDownload||S.isOwner;
@@ -179,6 +181,8 @@ function listenRoom(){
     }
     if(S.isOwner&&S.type==='group') renderOwnerPerms(users);
     renderMyPrivacy(users);
+    // Re-check all message visibility since someone's privacy may have changed
+    if(typeof reRenderPrivacyForAllMsgs==='function') reRenderPrivacyForAllMsgs();
   });
   const mRef=root.child('messages');
   const mAdd=mRef.orderByChild('timestamp').on('child_added',snap=>{
@@ -346,16 +350,66 @@ async function toggleMyVis(uid,allow){
   const isAll=allOthers.length>0&&allOthers.every(k=>current.includes(k));
   const newVal=isAll?null:current;
   S.myVisibleTo=newVal;
+  // Update live users cache immediately so canView picks up the change
+  if(S.roomUsers[S.uid]) S.roomUsers[S.uid].myVisibleTo=newVal;
   await db.ref(`rooms/${S.room}/users/${S.uid}/myVisibleTo`).set(newVal);
+  // Re-evaluate visibility of all rendered messages from us
+  reRenderPrivacyForAllMsgs();
   toast(allow?'\u2713 Now visible to user':'\uD83D\uDD12 Hidden from user \u2014 new messages encrypted for them','info');
+}
+
+function reRenderPrivacyForAllMsgs(){
+  // Walk all rendered messages and update their display based on canView
+  document.querySelectorAll('.msg-wrap').forEach(wrap=>{
+    const id=wrap.id.replace('msg-','');
+    const cached=S.msgCache[id];
+    if(!cached) return;
+    // Only re-render messages FROM us (others can't change via our privacy toggle)
+    // Actually re-render ALL messages since canView checks sender's live privacy
+    const nowCanSee=cached.from?canViewFrom(cached):true;
+    const body=wrap.querySelector('.msg-content');
+    if(!body) return;
+    const wasEncOnly=body.classList.contains('msg-encrypted-only');
+    if(!wasEncOnly&&!nowCanSee){
+      // Hide: replace with encrypted-only view
+      if(cached.content) body.textContent=EmojiCipher.shortDisplay(cached.content);
+      body.classList.add('msg-encrypted-only');
+      const btn=body.nextElementSibling;
+      if(btn&&btn.classList.contains('btn-reveal'))btn.remove();
+    }
+    // Note: we don't auto-reveal in the other direction here to avoid spoiling UX
+  });
 }
 
 function canView(data){
   if(data.from===S.uid) return true;
-  if(!data.visibleTo) return true; // null means visible to all
-  // Firebase may return array or object; normalize to array
-  const list=Array.isArray(data.visibleTo)?data.visibleTo:Object.values(data.visibleTo);
-  if(!list.includes(S.uid)) return false;
+
+  // Check sender's LIVE current privacy setting (most up-to-date)
+  const sender=S.roomUsers[data.from];
+  if(sender&&sender.myVisibleTo!==undefined&&sender.myVisibleTo!==null){
+    // Normalize: Firebase may return object instead of array
+    const liveList=Array.isArray(sender.myVisibleTo)
+      ? sender.myVisibleTo
+      : Object.values(sender.myVisibleTo);
+    if(!liveList.includes(S.uid)) return false;
+  }
+
+  // Also check the baked-in visibleTo on the message (fallback / belt-and-suspenders)
+  if(data.visibleTo){
+    const list=Array.isArray(data.visibleTo)?data.visibleTo:Object.values(data.visibleTo);
+    if(!list.includes(S.uid)) return false;
+  }
+
+  return true;
+}
+// canViewFrom: same as canView but takes a cached entry {from, visibleTo?}
+function canViewFrom(cached){
+  if(cached.from===S.uid) return true;
+  const sender=S.roomUsers[cached.from];
+  if(sender&&sender.myVisibleTo!==undefined&&sender.myVisibleTo!==null){
+    const liveList=Array.isArray(sender.myVisibleTo)?sender.myVisibleTo:Object.values(sender.myVisibleTo);
+    if(!liveList.includes(S.uid)) return false;
+  }
   return true;
 }
 
@@ -718,7 +772,7 @@ function renderMessage(id,data){
   if(data.reactions) updateReactions(id,data);
   if(data.kicked) forceLeave('You were removed from this room');
   // Cache for search
-  S.msgCache[id]={fromName:data.fromName||'?',content:data.content||null,type:data.type,timestamp:data.timestamp,canSee};
+  S.msgCache[id]={from:data.from,fromName:data.fromName||'?',content:data.content||null,type:data.type,timestamp:data.timestamp,canSee};
 }
 
 function buildMessageBody(id,data,isMine,canSee){
@@ -1256,7 +1310,7 @@ function cleanup(){
   Object.values(S.timers).forEach(clearTimeout); S.timers={};
   Object.values(S.schedTimers).forEach(clearTimeout); S.schedTimers={};
   if(S.sessInterval){clearInterval(S.sessInterval);S.sessInterval=null;}
-  S.revealed.clear(); S.msgCache={}; S.userNames={}; S.pinnedMsgId=null; S.replyTo=null;
+  S.revealed.clear(); S.msgCache={}; S.userNames={}; S.roomUsers={}; S.pinnedMsgId=null; S.replyTo=null;
 }
 
 // ── Chat init ──────────────────────────────────────────────────────────────
