@@ -1,14 +1,3 @@
-/**
- * VoidChat v7 — New features:
- * - Message Pinning (owner can pin any message to top bar)
- * - Read Receipt Timestamps (hover tooltips with exact per-user read times)
- * - Reply Threading (quote any message, reply linked to original)
- * - Smart Emoji Cipher Visualizer (animated encryption preview on send)
- * - Client-side Message Search (decrypts locally, highlights matches)
- * - Canary Token Detection (owner plants a trip-wire message, alerts on unexpected reads)
- * + UI animation improvements
- */
-
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 
@@ -31,13 +20,11 @@ const S = {
   recorder:null, recordingChunks:[], isRecording:false, recordTimer:null,
   peerConn:null, localStream:null, callId:null, inCall:false,
   pollOptions:['',''], checkItems:[],
-  // New state
   pinnedMsgId:null,
-  replyTo:null,            // {id, fromName, preview}
+  replyTo:null,
   searchOpen:false,
-  msgCache:{},             // id→{fromName,plainText} for search
-  userNames:{},            // uid→name for receipt display
-  roomUsers:{},            // uid→user record (live, for privacy checks)
+  msgCache:{},
+  roomUsers:{},
 };
 localStorage.setItem('vc_uid', S.uid);
 
@@ -118,9 +105,7 @@ async function handleCreate(){
   S.name=name; S.isOwner=true; S.type=type; S.room=genCode(); S.canDownload=true;
   const expiresAt=sessMin>0?Date.now()+sessMin*60*1000:null; S.roomExpires=expiresAt;
   await db.ref(`rooms/${S.room}`).set({type,maxUsers,owner:S.uid,created:Date.now(),expiresAt,closed:false});
-  await db.ref(`rooms/${S.room}/users/${S.uid}`).set({
-    name, online:true, joinedAt:Date.now(), canDownload:true, myVisibleTo:null
-  });
+  await db.ref(`rooms/${S.room}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:true,myVisibleTo:null});
   db.ref(`rooms/${S.room}/users/${S.uid}/online`).onDisconnect().set(false);
   saveSess(); enterChat();
 }
@@ -141,9 +126,7 @@ async function handleJoin(){
   }
   S.name=name; S.isOwner=false; S.room=code; S.type=r.type;
   S.canDownload=false; S.roomExpires=r.expiresAt||null;
-  await db.ref(`rooms/${code}/users/${S.uid}`).set({
-    name, online:true, joinedAt:Date.now(), canDownload:false, myVisibleTo:null
-  });
+  await db.ref(`rooms/${code}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:false,myVisibleTo:null});
   db.ref(`rooms/${code}/users/${S.uid}/online`).onDisconnect().set(false);
   saveSess(); enterChat();
 }
@@ -154,10 +137,69 @@ function enterChat(){
   $('chat-room-code').textContent=S.room;
   $('sb-room-code').textContent=S.room;
   $('room-type-badge').textContent=S.type==='duo'?'⚡ DUO':'◈ GROUP';
-  $('btn-permissions').classList.toggle('hidden', !(S.isOwner&&S.type==='group'));
+  $('btn-permissions').classList.toggle('hidden',!(S.isOwner&&S.type==='group'));
   $('btn-close-room').classList.toggle('hidden',!S.isOwner);
   listenRoom();
   if(S.roomExpires) startSessTimer();
+}
+
+// ── PRIVACY HELPERS ────────────────────────────────────────────────────────
+// Normalize Firebase value (may be object) to array or null
+function normArr(v){
+  if(v===null||v===undefined) return null;
+  if(Array.isArray(v)) return v;
+  return Object.values(v);
+}
+
+// Can the current user see this message?
+// Checks BOTH baked-in visibleTo AND the sender's LIVE current myVisibleTo from roomUsers
+function canView(data){
+  if(data.from===S.uid) return true;
+  // Check sender's live privacy setting first (most up-to-date)
+  const sender=S.roomUsers[data.from];
+  if(sender){
+    const liveVis=normArr(sender.myVisibleTo);
+    if(liveVis!==null && !liveVis.includes(S.uid)) return false;
+  }
+  // Also check baked-in visibleTo on the message
+  const msgVis=normArr(data.visibleTo);
+  if(msgVis!==null && !msgVis.includes(S.uid)) return false;
+  return true;
+}
+
+// Re-render all messages based on current privacy state
+function reRenderAllMsgVisibility(){
+  document.querySelectorAll('.msg-wrap').forEach(wrap=>{
+    const id=wrap.id.replace('msg-','');
+    const cached=S.msgCache[id]; if(!cached||cached.from===S.uid) return;
+    const nowCanSee=canView(cached);
+    const body=wrap.querySelector('.msg-content'); if(!body) return;
+    const wasEncOnly=body.classList.contains('msg-encrypted-only');
+    if(!wasEncOnly && !nowCanSee){
+      // Was visible, now restricted — show encrypted only, no reveal button
+      S.revealed.delete(id);
+      if(cached.content) body.textContent=EmojiCipher.shortDisplay(cached.content);
+      body.classList.add('msg-encrypted-only');
+      body.removeAttribute('id'); body.removeAttribute('data-raw'); body.removeAttribute('data-state');
+      const btn=body.nextElementSibling;
+      if(btn&&btn.classList.contains('btn-reveal')) btn.remove();
+    } else if(wasEncOnly && nowCanSee && cached.content){
+      // Was hidden, now allowed — restore reveal button
+      body.classList.remove('msg-encrypted-only');
+      body.id='mc-'+id;
+      body.dataset.id=id;
+      body.dataset.raw=encodeURIComponent(cached.content);
+      body.dataset.state='encrypted';
+      body.textContent=EmojiCipher.shortDisplay(cached.content);
+      // Add reveal button if missing
+      if(!body.nextElementSibling||!body.nextElementSibling.classList.contains('btn-reveal')){
+        const btn=ce('button'); btn.className='btn-reveal';
+        btn.textContent='👁 REVEAL';
+        btn.onclick=()=>toggleReveal(id);
+        body.insertAdjacentElement('afterend',btn);
+      }
+    }
+  });
 }
 
 function listenRoom(){
@@ -165,24 +207,20 @@ function listenRoom(){
   const uRef=root.child('users');
   const uL=uRef.on('value',snap=>{
     const users=snap.val()||{};
-    renderUsers(users);
-    // Keep uid→name map for receipt tooltips, and live user records for privacy
-    for(const[uid,u]of Object.entries(users)){if(u&&u.name)S.userNames[uid]=u.name;}
+    // Update live user cache FIRST so canView uses latest data
     S.roomUsers=users;
     const me=users[S.uid];
     if(me){
       S.canDownload=!!me.canDownload||S.isOwner;
-      // Normalize myVisibleTo: Firebase returns object when array was stored
-      const mv=me.myVisibleTo;
-      if(mv===null||mv===undefined) S.myVisibleTo=null;
-      else if(Array.isArray(mv)) S.myVisibleTo=mv;
-      else S.myVisibleTo=Object.values(mv);
+      // Normalize myVisibleTo from Firebase (object vs array)
+      S.myVisibleTo=normArr(me.myVisibleTo);
       $('btn-download-chat').classList.toggle('hidden',!S.canDownload);
     }
+    renderUsers(users);
     if(S.isOwner&&S.type==='group') renderOwnerPerms(users);
     renderMyPrivacy(users);
-    // Re-check all message visibility since someone's privacy may have changed
-    if(typeof reRenderPrivacyForAllMsgs==='function') reRenderPrivacyForAllMsgs();
+    // Re-check all message visibility whenever any user's privacy changes
+    reRenderAllMsgVisibility();
   });
   const mRef=root.child('messages');
   const mAdd=mRef.orderByChild('timestamp').on('child_added',snap=>{
@@ -193,24 +231,24 @@ function listenRoom(){
     const d=snap.val(); if(!d)return;
     updateReceipts(snap.key,d); updateReactions(snap.key,d); updatePollUI(snap.key,d);
     updateChecklistUI(snap.key,d);
-    // Re-check visibility in case visibleTo changed after render
-    updateMsgVisibility(snap.key,d);
   });
   const mDel=mRef.on('child_removed',snap=>{
     removeMsgUI(snap.key);
     if(snap.key===S.pinnedMsgId) clearPinnedBar();
   });
+  // FIXED: scheduled delivery — all users listen, sender delivers
   const sRef=root.child('scheduled');
-  const sAdd=sRef.on('child_added',snap=>{const d=snap.val();if(!d||d.from!==S.uid)return;scheduleDelivery(snap.key,d);});
-
-  // Pinned message listener
+  const sAdd=sRef.on('child_added',snap=>{
+    const d=snap.val(); if(!d) return;
+    // Only the original sender runs the timer to deliver
+    if(d.from===S.uid) scheduleDelivery(snap.key,d);
+  });
   const pinRef=root.child('pinned');
   const pinL=pinRef.on('value',snap=>{
     const d=snap.val();
     if(d&&d.msgId) renderPinnedBar(d);
     else clearPinnedBar();
   });
-
   root.child('closed').on('value',snap=>{if(snap.val()===true&&!S.isOwner)forceLeave('Room was closed');});
   root.child('call').on('value',snap=>{const d=snap.val();if(d)handleCallSignal(d);});
   S.listeners=[
@@ -302,20 +340,18 @@ async function kickUser(uid,name){
 // ── My Privacy ─────────────────────────────────────────────────────────────
 function renderMyPrivacy(users){
   const p=$('my-privacy-list'); if(!p)return; p.innerHTML='';
-  // Normalize myVisibleTo (Firebase may return object instead of array)
-  let visArr=S.myVisibleTo;
-  if(visArr!==null&&!Array.isArray(visArr)) visArr=Object.values(visArr||{});
   for(const[uid,u]of Object.entries(users)){
     if(!u||uid===S.uid)continue;
-    const allowed=S.myVisibleTo===null||(Array.isArray(visArr)&&visArr.includes(uid));
+    // Use normalized S.myVisibleTo (already normalized in listener)
+    const allowed=S.myVisibleTo===null || (Array.isArray(S.myVisibleTo)&&S.myVisibleTo.includes(uid));
     const row=ce('div'); row.className='perm-row';
     const bg=avatarBg(u.name||'?');
     row.innerHTML=`
       <div class="pa" style="background:${bg}">${avatarLetter(u.name||'?')}</div>
       <div class="pm">
         <span class="pn">${esc(u.name||'?')}</span>
-        <span class="ps ${u.online?'online':'offline'}">${u.online?'\u25CF ONLINE':'\u25CB OFFLINE'}</span>
-        <span class="ps" style="color:${allowed?'#00ff41':'#ff4444'};font-size:9px">${allowed?'\u2713 CAN READ':'\uD83D\uDD12 ENCRYPTED'}</span>
+        <span class="ps ${u.online?'online':'offline'}">${u.online?'● ONLINE':'○ OFFLINE'}</span>
+        <span class="priv-status" style="color:${allowed?'#00ff41':'#ff4444'};font-size:9px;display:block">${allowed?'✓ CAN READ':'🔒 BLOCKED'}</span>
       </div>
       <label class="toggle-switch">
         <input type="checkbox" ${allowed?'checked':''} onchange="toggleMyVis('${uid}',this.checked)">
@@ -323,22 +359,16 @@ function renderMyPrivacy(users){
       </label>`;
     p.appendChild(row);
   }
-  if(!p.children.length) p.innerHTML='<div class="perm-empty">No other users yet\u2026</div>';
+  if(!p.children.length) p.innerHTML='<div class="perm-empty">No other users yet…</div>';
 }
-async function toggleMyVis(uid,allow){
-  // Get all other users in the room
-  const us=await db.ref(`rooms/${S.room}/users`).once('value');
-  const allOthers=Object.keys(us.val()||{}).filter(k=>k!==S.uid);
 
-  // Normalize current state: null=everyone, object/array=restricted list
-  let current=S.myVisibleTo;
-  if(current===null){
-    current=[...allOthers]; // expand to explicit full list
-  } else if(!Array.isArray(current)){
-    current=Object.values(current); // Firebase may return object
-  } else {
-    current=[...current];
-  }
+async function toggleMyVis(uid, allow){
+  // Get all other users
+  const snap=await db.ref(`rooms/${S.room}/users`).once('value');
+  const allOthers=Object.keys(snap.val()||{}).filter(k=>k!==S.uid);
+
+  // Build current list from S.myVisibleTo (already normalized)
+  let current = S.myVisibleTo===null ? [...allOthers] : [...(S.myVisibleTo||[])];
 
   if(allow){
     if(!current.includes(uid)) current.push(uid);
@@ -346,71 +376,20 @@ async function toggleMyVis(uid,allow){
     current=current.filter(k=>k!==uid);
   }
 
-  // If list equals everyone, store null (visible to all)
-  const isAll=allOthers.length>0&&allOthers.every(k=>current.includes(k));
-  const newVal=isAll?null:current;
-  S.myVisibleTo=newVal;
-  // Update live users cache immediately so canView picks up the change
-  if(S.roomUsers[S.uid]) S.roomUsers[S.uid].myVisibleTo=newVal;
+  // If all others are included, save null (visible to everyone)
+  const isAll = allOthers.length>0 && allOthers.every(k=>current.includes(k));
+  const newVal = isAll ? null : current;
+
+  // Update local state immediately BEFORE Firebase so reRender uses new value
+  S.myVisibleTo = newVal;
+  if(S.roomUsers[S.uid]) S.roomUsers[S.uid].myVisibleTo = newVal;
+
+  // Re-render messages immediately with new privacy
+  reRenderAllMsgVisibility();
+
+  // Persist to Firebase
   await db.ref(`rooms/${S.room}/users/${S.uid}/myVisibleTo`).set(newVal);
-  // Re-evaluate visibility of all rendered messages from us
-  reRenderPrivacyForAllMsgs();
-  toast(allow?'\u2713 Now visible to user':'\uD83D\uDD12 Hidden from user \u2014 new messages encrypted for them','info');
-}
-
-function reRenderPrivacyForAllMsgs(){
-  // Walk all rendered messages and update their display based on canView
-  document.querySelectorAll('.msg-wrap').forEach(wrap=>{
-    const id=wrap.id.replace('msg-','');
-    const cached=S.msgCache[id];
-    if(!cached) return;
-    // Only re-render messages FROM us (others can't change via our privacy toggle)
-    // Actually re-render ALL messages since canView checks sender's live privacy
-    const nowCanSee=cached.from?canViewFrom(cached):true;
-    const body=wrap.querySelector('.msg-content');
-    if(!body) return;
-    const wasEncOnly=body.classList.contains('msg-encrypted-only');
-    if(!wasEncOnly&&!nowCanSee){
-      // Hide: replace with encrypted-only view
-      if(cached.content) body.textContent=EmojiCipher.shortDisplay(cached.content);
-      body.classList.add('msg-encrypted-only');
-      const btn=body.nextElementSibling;
-      if(btn&&btn.classList.contains('btn-reveal'))btn.remove();
-    }
-    // Note: we don't auto-reveal in the other direction here to avoid spoiling UX
-  });
-}
-
-function canView(data){
-  if(data.from===S.uid) return true;
-
-  // Check sender's LIVE current privacy setting (most up-to-date)
-  const sender=S.roomUsers[data.from];
-  if(sender&&sender.myVisibleTo!==undefined&&sender.myVisibleTo!==null){
-    // Normalize: Firebase may return object instead of array
-    const liveList=Array.isArray(sender.myVisibleTo)
-      ? sender.myVisibleTo
-      : Object.values(sender.myVisibleTo);
-    if(!liveList.includes(S.uid)) return false;
-  }
-
-  // Also check the baked-in visibleTo on the message (fallback / belt-and-suspenders)
-  if(data.visibleTo){
-    const list=Array.isArray(data.visibleTo)?data.visibleTo:Object.values(data.visibleTo);
-    if(!list.includes(S.uid)) return false;
-  }
-
-  return true;
-}
-// canViewFrom: same as canView but takes a cached entry {from, visibleTo?}
-function canViewFrom(cached){
-  if(cached.from===S.uid) return true;
-  const sender=S.roomUsers[cached.from];
-  if(sender&&sender.myVisibleTo!==undefined&&sender.myVisibleTo!==null){
-    const liveList=Array.isArray(sender.myVisibleTo)?sender.myVisibleTo:Object.values(sender.myVisibleTo);
-    if(!liveList.includes(S.uid)) return false;
-  }
-  return true;
+  toast(allow ? '✓ User can now read your messages' : '🔒 User blocked — messages now encrypted for them', 'info');
 }
 
 // ── Schedule / Destruct ────────────────────────────────────────────────────
@@ -606,40 +585,10 @@ async function toggleCheckItem(msgId,index){
 }
 function updateChecklistUI(id,data){
   if(data.type!=='checklist')return;
-  const wrap=document.getElementById(`msg-${id}`);
-  if(!wrap)return;
+  const wrap=document.getElementById(`msg-${id}`); if(!wrap)return;
   const old=wrap.querySelector('.checklist-msg');
   if(old){const tmp=ce('div');tmp.innerHTML=buildChecklistMsg(id,data);old.replaceWith(tmp.firstChild);}
 }
-function updateMsgVisibility(id,data){
-  if(data.from===S.uid)return; // own messages always visible
-  const wrap=document.getElementById(`msg-${id}`); if(!wrap)return;
-  const nowCanSee=canView(data);
-  const body=wrap.querySelector('.msg-content');
-  if(!body)return;
-  const wasEncOnly=body.classList.contains('msg-encrypted-only');
-  if(wasEncOnly&&nowCanSee){
-    // Was hidden, now allowed — re-render the message body
-    const bodyWrap=wrap.querySelector('.mb');
-    if(bodyWrap){
-      const isMine=data.from===S.uid;
-      const newBody=buildMessageBody(id,data,isMine,true);
-      // Replace content area (keep timerBar, footer etc.)
-      const oldContent=bodyWrap.querySelector('.msg-content');
-      const oldBtn=bodyWrap.querySelector('.btn-reveal');
-      if(oldContent){const tmp=ce('div');tmp.innerHTML=newBody;oldContent.replaceWith(tmp.firstChild||oldContent);}
-      if(oldBtn)oldBtn.remove();
-      autoRevealMessage(id,data);
-    }
-  } else if(!wasEncOnly&&!nowCanSee&&body.dataset.state==='encrypted'){
-    // Was visible, now restricted — show encrypted only
-    if(data.content) body.innerHTML=EmojiCipher.shortDisplay(data.content);
-    body.classList.add('msg-encrypted-only');
-    const btn=body.nextElementSibling;
-    if(btn&&btn.classList.contains('btn-reveal'))btn.remove();
-  }
-}
-
 
 // ── Location & Contact ─────────────────────────────────────────────────────
 function shareLocation(){
@@ -669,18 +618,20 @@ async function handleSend(){
   closeInputPanels(); $('btn-send').disabled=true;
   try{
     if(S.schedTime){
+      // FIXED: save plain text, deliver encrypted later with correct msgId key
       const schedRef=db.ref(`rooms/${S.room}/scheduled`).push();
-      const enc=await EmojiCipher.encrypt(text,S.room,schedRef.key);
-      await schedRef.set({from:S.uid,fromName:S.name,timestamp:S.schedTime,scheduledFor:S.schedTime,
-        sent:false,content:enc,type:'text',
+      await schedRef.set({
+        from:S.uid, fromName:S.name,
+        timestamp:S.schedTime, scheduledFor:S.schedTime,
+        sent:false, plainText:text, type:'text',
         expiresAt:S.destructSecs>0?S.schedTime+S.destructSecs*1000:null,
-        revealSecs:S.revealSecs,visibleTo:S.myVisibleTo});
+        revealSecs:S.revealSecs, visibleTo:S.myVisibleTo
+      });
       toast(`Scheduled: ${fmtDT(S.schedTime)}`,'success');
       clearSchedule(); clearDestruct();
-    }else{
+    } else {
       const msgRef=db.ref(`rooms/${S.room}/messages`).push();
       const msgId=msgRef.key;
-      // Show cipher visualizer before sending
       await showCipherVisualizer(text);
       const enc=await EmojiCipher.encrypt(text,S.room,msgId);
       const payload={
@@ -688,7 +639,7 @@ async function handleSend(){
         expiresAt:S.destructSecs>0?Date.now()+S.destructSecs*1000:null,
         revealSecs:S.revealSecs||0,
         oneTimeView:$('toggle-otv').checked,
-        readBy:{[S.uid]:Date.now()},delivered:{[S.uid]:Date.now()},
+        readBy:{[S.uid]:Date.now()}, delivered:{[S.uid]:Date.now()},
         type:'text', content:enc, visibleTo:S.myVisibleTo,
       };
       if(S.replyTo) payload.replyTo=S.replyTo;
@@ -700,27 +651,32 @@ async function handleSend(){
   $('btn-send').disabled=false; $('msg-input').focus();
 }
 
-// ── Scheduled Delivery ─────────────────────────────────────────────────────
-function scheduleDelivery(schedId,data){
-  const delay=Math.max(0,data.scheduledFor-Date.now());
+// ── Scheduled Delivery — FIXED ─────────────────────────────────────────────
+function scheduleDelivery(schedId, data){
+  const delay=Math.max(0, data.scheduledFor - Date.now());
   S.schedTimers[schedId]=setTimeout(async()=>{
-    const msgRef=db.ref(`rooms/${S.room}/messages`).push(); const msgId=msgRef.key;
-    let content=data.content;
-    if(content){const plain=await EmojiCipher.decrypt(content,S.room,schedId);content=await EmojiCipher.encrypt(plain,S.room,msgId);}
-    const payload={from:data.from,fromName:data.fromName,timestamp:Date.now(),
-      expiresAt:data.expiresAt,revealSecs:data.revealSecs||0,
-      readBy:{[S.uid]:Date.now()},delivered:{[S.uid]:Date.now()},
-      type:data.type||'text',content,wasScheduled:true,visibleTo:data.visibleTo||null};
-    if(data.replyTo) payload.replyTo=data.replyTo;
-    await msgRef.set(payload);
-    await db.ref(`rooms/${S.room}/scheduled/${schedId}`).remove();
-    delete S.schedTimers[schedId];
-    toast('⏰ Scheduled message delivered!','success');
-  },delay);
+    try{
+      const msgRef=db.ref(`rooms/${S.room}/messages`).push();
+      const msgId=msgRef.key;
+      // FIXED: encrypt fresh with the real message ID key
+      const plain = data.plainText || '';
+      const enc = plain ? await EmojiCipher.encrypt(plain, S.room, msgId) : '';
+      const payload={
+        from:data.from, fromName:data.fromName, timestamp:Date.now(),
+        expiresAt:data.expiresAt||null, revealSecs:data.revealSecs||0,
+        readBy:{[S.uid]:Date.now()}, delivered:{[S.uid]:Date.now()},
+        type:'text', content:enc, wasScheduled:true, visibleTo:data.visibleTo||null
+      };
+      await msgRef.set(payload);
+      await db.ref(`rooms/${S.room}/scheduled/${schedId}`).remove();
+      delete S.schedTimers[schedId];
+      toast('⏰ Scheduled message delivered!','success');
+    }catch(e){console.error('Schedule delivery failed',e);}
+  }, delay);
 }
 
 // ── Render Message ─────────────────────────────────────────────────────────
-function renderMessage(id,data){
+function renderMessage(id, data){
   if(data.expiresAt&&Date.now()>data.expiresAt){db.ref(`rooms/${S.room}/messages/${id}`).remove();return;}
   if(document.getElementById(`msg-${id}`))return;
   const isMine=data.from===S.uid;
@@ -771,8 +727,9 @@ function renderMessage(id,data){
   }
   if(data.reactions) updateReactions(id,data);
   if(data.kicked) forceLeave('You were removed from this room');
-  // Cache for search
-  S.msgCache[id]={from:data.from,fromName:data.fromName||'?',content:data.content||null,type:data.type,timestamp:data.timestamp,canSee};
+  // Cache for search and privacy re-renders
+  S.msgCache[id]={from:data.from, fromName:data.fromName||'?', content:data.content||null,
+    visibleTo:data.visibleTo||null, type:data.type, timestamp:data.timestamp, canSee};
 }
 
 function buildMessageBody(id,data,isMine,canSee){
@@ -797,33 +754,28 @@ function buildReplyQuote(replyTo){
     <span class="rq-preview">${preview||'[message]'}</span>
   </div>`;
 }
-
 function scrollToMsg(id){
-  const el=document.getElementById(`msg-${id}`);
-  if(!el)return;
+  const el=document.getElementById(`msg-${id}`); if(!el)return;
   el.scrollIntoView({behavior:'smooth',block:'center'});
   el.classList.add('msg-highlight');
   setTimeout(()=>el.classList.remove('msg-highlight'),1600);
 }
-
 function setReplyFrom(msgId){
   const wrap=document.getElementById(`msg-${msgId}`); if(!wrap)return;
   const senderEl=wrap.querySelector('.msender');
   const fromName=senderEl?senderEl.textContent:(wrap.classList.contains('mine')?S.name:'?');
   const mc=wrap.querySelector(`#mc-${msgId}`);
   const preview=mc?.dataset.state==='revealed'?mc.textContent:'[encrypted]';
-  setReply(msgId, fromName, preview);
+  setReply(msgId,fromName,preview);
 }
-
-function setReply(id, fromName, preview){
-  S.replyTo={id, fromName, preview};
+function setReply(id,fromName,preview){
+  S.replyTo={id,fromName,preview};
   const bar=$('reply-bar'); if(!bar)return;
   $('reply-sender').textContent=fromName;
   $('reply-preview').textContent=(preview||'').slice(0,80);
   bar.classList.remove('hidden');
   $('msg-input').focus();
 }
-
 function clearReply(){
   S.replyTo=null;
   const bar=$('reply-bar'); if(bar)bar.classList.add('hidden');
@@ -833,13 +785,12 @@ function clearReply(){
 function buildTextMsg(id,data,isMine,canSee){
   if(!data.content) return '';
   if(!canSee){
-    return `<div class="msg-content msg-encrypted-only" title="Sender restricted visibility">${EmojiCipher.shortDisplay(data.content)}</div>`;
+    return `<div class="msg-content msg-encrypted-only" title="You don't have permission to read this message">${EmojiCipher.shortDisplay(data.content)}</div>`;
   }
   const display=EmojiCipher.shortDisplay(data.content);
   return `<div class="msg-content" id="mc-${id}" data-id="${id}" data-raw="${encodeURIComponent(data.content)}" data-state="encrypted">${display}</div>
   <button class="btn-reveal" onclick="toggleReveal('${id}')">👁 REVEAL</button>`;
 }
-
 function buildImageMsg(data){
   return `<div class="msg-image-wrap"><img class="msg-img" src="${data.fileUrl}" alt="${esc(data.fileName||'image')}" loading="lazy" onclick="openLightbox('${data.fileUrl}')" onerror="this.style.display='none'">
   ${data.fileName?`<div class="img-caption">${esc(data.fileName)}</div>`:''}</div>`;
@@ -907,7 +858,6 @@ async function autoRevealMessage(id,data){
   const plain=await EmojiCipher.decrypt(data.content,S.room,id);
   if(!plain||plain==='🔒')return;
   el.textContent=plain; el.classList.add('revealed'); el.dataset.state='revealed';
-  // Cache plain text for search
   if(S.msgCache[id]) S.msgCache[id].plainText=plain;
   S.revealed.add(id);
   const btn=el.nextElementSibling; if(btn?.classList.contains('btn-reveal'))btn.textContent='🔒 HIDE';
@@ -967,19 +917,19 @@ async function toggleReveal(id){
   }
 }
 
-// ── Read Receipts with Timestamps ──────────────────────────────────────────
+// ── Read Receipts ──────────────────────────────────────────────────────────
 function buildReceipt(data){
   const others=obj=>Object.entries(obj||{}).filter(([k])=>k!==S.uid);
   const readers=others(data.readBy);
   const deliveries=others(data.delivered);
-  const nameOf=uid=>S.userNames[uid]||uid.slice(0,8)+'…';
+  const nameOf=uid=>S.roomUsers[uid]?.name||uid.slice(0,8)+'…';
   let icon='<span class="rcpt rcpt-sent">✓</span>';
   if(readers.length>0){
     const tipLines=readers.map(([uid,ts])=>`${nameOf(uid)}: ${fmtFull(ts)}`).join('\n');
-    icon=`<span class="rcpt rcpt-read has-tip" data-tip="${esc(tipLines)}">✓✓<span class="rcpt-tip">${esc(tipLines.replace(/\n/g,'&#10;'))}</span></span>`;
+    icon=`<span class="rcpt rcpt-read has-tip">✓✓<span class="rcpt-tip">${esc(tipLines.replace(/\n/g,'&#10;'))}</span></span>`;
   } else if(deliveries.length>0){
     const tipLines=deliveries.map(([uid,ts])=>`${nameOf(uid)}: delivered ${fmtFull(ts)}`).join('\n');
-    icon=`<span class="rcpt rcpt-dlvr has-tip" data-tip="${esc(tipLines)}">✓✓<span class="rcpt-tip">${esc(tipLines.replace(/\n/g,'&#10;'))}</span></span>`;
+    icon=`<span class="rcpt rcpt-dlvr has-tip">✓✓<span class="rcpt-tip">${esc(tipLines.replace(/\n/g,'&#10;'))}</span></span>`;
   }
   return icon;
 }
@@ -1026,20 +976,14 @@ function removeMsgUI(id){
   const el=document.getElementById(`msg-${id}`);
   if(el){el.classList.add('msg-out');setTimeout(()=>el.remove(),300);}
   if(S.timers[id]){clearTimeout(S.timers[id]);delete S.timers[id];}
-  S.revealed.delete(id);
-  delete S.msgCache[id];
+  S.revealed.delete(id); delete S.msgCache[id];
 }
 
-// ── MESSAGE PINNING ────────────────────────────────────────────────────────
-async function pinMessage(msgId, e){
+// ── Message Pinning ────────────────────────────────────────────────────────
+async function pinMessage(msgId,e){
   e.stopPropagation();
   if(!S.isOwner){toast('Only owner can pin','error');return;}
-  if(S.pinnedMsgId===msgId){
-    await db.ref(`rooms/${S.room}/pinned`).remove();
-    toast('Message unpinned','info');
-    return;
-  }
-  // Get a preview of the message content
+  if(S.pinnedMsgId===msgId){await db.ref(`rooms/${S.room}/pinned`).remove();toast('Message unpinned','info');return;}
   const cached=S.msgCache[msgId];
   let preview='[message]';
   if(cached){
@@ -1050,49 +994,29 @@ async function pinMessage(msgId, e){
   }
   const msgEl=document.getElementById(`msg-${msgId}`);
   const fromName=msgEl?.querySelector('.msender')?.textContent||S.name;
-  await db.ref(`rooms/${S.room}/pinned`).set({
-    msgId, fromName, preview, pinnedAt:Date.now(), pinnedBy:S.name
-  });
+  await db.ref(`rooms/${S.room}/pinned`).set({msgId,fromName,preview,pinnedAt:Date.now(),pinnedBy:S.name});
   toast('📌 Message pinned','success');
 }
-
 function renderPinnedBar(data){
   S.pinnedMsgId=data.msgId;
   const bar=$('pinned-bar'); if(!bar)return;
   $('pinned-sender').textContent=data.fromName||'?';
   $('pinned-preview').textContent=(data.preview||'[message]').slice(0,70);
   bar.classList.remove('hidden');
-  bar.classList.add('pin-slide-in');
 }
-
-function clearPinnedBar(){
-  S.pinnedMsgId=null;
-  const bar=$('pinned-bar'); if(bar)bar.classList.add('hidden');
-}
-
+function clearPinnedBar(){S.pinnedMsgId=null;const bar=$('pinned-bar');if(bar)bar.classList.add('hidden');}
 async function unpinFromBar(){
   if(!S.isOwner){toast('Only owner can unpin','error');return;}
-  await db.ref(`rooms/${S.room}/pinned`).remove();
-  toast('Unpinned','info');
+  await db.ref(`rooms/${S.room}/pinned`).remove();toast('Unpinned','info');
 }
+function scrollToPinned(){if(S.pinnedMsgId)scrollToMsg(S.pinnedMsgId);}
 
-function scrollToPinned(){
-  if(S.pinnedMsgId) scrollToMsg(S.pinnedMsgId);
-}
-
-// ── CIPHER VISUALIZER ─────────────────────────────────────────────────────
+// ── Cipher Visualizer ──────────────────────────────────────────────────────
 function initCipherVisualizer(){
-  // Create overlay element
   const ov=ce('div'); ov.id='cipher-viz'; ov.className='cipher-viz hidden';
-  ov.innerHTML=`
-    <div class="cv-inner">
-      <div class="cv-label">ENCRYPTING</div>
-      <div class="cv-text" id="cv-text"></div>
-      <div class="cv-bar"><div id="cv-progress"></div></div>
-    </div>`;
+  ov.innerHTML=`<div class="cv-inner"><div class="cv-label">ENCRYPTING</div><div class="cv-text" id="cv-text"></div><div class="cv-bar"><div id="cv-progress"></div></div></div>`;
   document.body.appendChild(ov);
 }
-
 async function showCipherVisualizer(plainText){
   const ov=$('cipher-viz'); if(!ov)return;
   const display=$('cv-text'); if(!display)return;
@@ -1103,8 +1027,7 @@ async function showCipherVisualizer(plainText){
   const prog=$('cv-progress');
   for(let i=0;i<steps;i++){
     const mixed=chars.map((c,j)=>{
-      const ratio=j/(chars.length||1);
-      const phase=i/steps;
+      const ratio=j/(chars.length||1),phase=i/steps;
       if(ratio<phase) return EMOJIS[Math.floor(Math.random()*EMOJIS.length)];
       return c;
     }).join('');
@@ -1117,43 +1040,34 @@ async function showCipherVisualizer(plainText){
   ov.classList.add('hidden');
 }
 
-// ── MESSAGE SEARCH ────────────────────────────────────────────────────────
+// ── Message Search ────────────────────────────────────────────────────────
 function initSearch(){
   const overlay=$('search-overlay'); if(!overlay)return;
   $('search-input').addEventListener('input',debounce(runSearch,200));
   $('search-input').addEventListener('keydown',e=>{if(e.key==='Escape')closeSearch();});
 }
-
 function openSearch(){
   S.searchOpen=true;
   const ov=$('search-overlay'); if(!ov)return;
-  ov.classList.remove('hidden');
-  ov.classList.add('search-open-anim');
+  ov.classList.remove('hidden'); ov.classList.add('search-open-anim');
   $('search-input').value='';
   $('search-results').innerHTML='<div class="sr-hint">Type to decrypt and search messages…</div>';
   setTimeout(()=>$('search-input').focus(),100);
 }
-
 function closeSearch(){
   S.searchOpen=false;
   const ov=$('search-overlay'); if(!ov)return;
-  ov.classList.add('hidden');
-  ov.classList.remove('search-open-anim');
-  // Unhighlight all
+  ov.classList.add('hidden'); ov.classList.remove('search-open-anim');
   document.querySelectorAll('.msg-wrap.search-match').forEach(el=>el.classList.remove('search-match'));
 }
-
 const debounce=(fn,ms)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};};
-
 async function runSearch(){
   const q=$('search-input').value.trim().toLowerCase();
   const res=$('search-results');
   if(!q){res.innerHTML='<div class="sr-hint">Type to decrypt and search messages…</div>';return;}
   res.innerHTML='<div class="sr-hint">🔓 Decrypting…</div>';
-
   const results=[];
-  const ids=Object.keys(S.msgCache);
-  for(const id of ids){
+  for(const id of Object.keys(S.msgCache)){
     const cached=S.msgCache[id];
     if(!cached||!cached.canSee)continue;
     let plain=cached.plainText||null;
@@ -1162,29 +1076,20 @@ async function runSearch(){
       if(plain&&plain!=='🔒') cached.plainText=plain;
     }
     if(!plain)continue;
-    if(plain.toLowerCase().includes(q)){
-      results.push({id, fromName:cached.fromName, plain, timestamp:cached.timestamp});
-    }
+    if(plain.toLowerCase().includes(q)) results.push({id,fromName:cached.fromName,plain,timestamp:cached.timestamp});
   }
-
   document.querySelectorAll('.msg-wrap.search-match').forEach(el=>el.classList.remove('search-match'));
   if(!results.length){res.innerHTML='<div class="sr-hint">No matches found</div>';return;}
   results.sort((a,b)=>b.timestamp-a.timestamp);
   res.innerHTML='';
   results.forEach(r=>{
-    const hi=r.plain.replace(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`, 'gi'),'<mark>$1</mark>');
+    const hi=r.plain.replace(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'gi'),'<mark>$1</mark>');
     const div=ce('div'); div.className='sr-item';
     div.innerHTML=`<span class="sr-sender">${esc(r.fromName)}</span><span class="sr-time">${fmt(r.timestamp)}</span><div class="sr-text">${hi.slice(0,120)}</div>`;
-    div.addEventListener('click',()=>{
-      closeSearch();
-      scrollToMsg(r.id);
-      document.getElementById(`msg-${r.id}`)?.classList.add('search-match');
-    });
+    div.addEventListener('click',()=>{closeSearch();scrollToMsg(r.id);document.getElementById(`msg-${r.id}`)?.classList.add('search-match');});
     res.appendChild(div);
   });
 }
-
-
 
 // ── Download ───────────────────────────────────────────────────────────────
 async function downloadChat(){
@@ -1204,24 +1109,20 @@ async function downloadChat(){
     else if(m.type==='contact')  text=`[CONTACT: ${m.contactName} ${m.phone||''}]`;
     rows+=`<tr><td>${fmt(m.timestamp)}</td><td>${esc(m.fromName||'?')}</td><td>${esc(text||'—')}</td></tr>`;
   }
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>VoidChat — ${S.room}</title><style>body{font-family:monospace;background:#000;color:#00ff41;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#001400;color:#00ff41;padding:8px;text-align:left;border-bottom:2px solid #00ff41;}td{padding:8px;border-bottom:1px solid #002200;vertical-align:top;}</style></head><body><h1>🔐 VOIDCHAT — ${S.room}</h1><p style="color:#555">Downloaded by: ${esc(S.name)} — ${new Date().toLocaleString()}</p><table><thead><tr><th>TIME</th><th>FROM</th><th>MESSAGE</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>VoidChat — ${S.room}</title><style>body{font-family:monospace;background:#000;color:#00ff41;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#001400;color:#00ff41;padding:8px;text-align:left;border-bottom:2px solid #00ff41;}td{padding:8px;border-bottom:1px solid #002200;vertical-align:top;}</style></head><body><h1>🔐 VOIDCHAT — ${S.room}</h1><p style="color:#555">Downloaded: ${new Date().toLocaleString()}</p><table><thead><tr><th>TIME</th><th>FROM</th><th>MESSAGE</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
   const a=ce('a'); a.href=URL.createObjectURL(new Blob([html],{type:'text/html'})); a.download=`voidchat-${S.room}.html`; a.click();
   toast('Downloaded!','success');
 }
 
-// ── Voice Call (WebRTC) — FIXED ────────────────────────────────────────────
+// ── Voice Call (WebRTC) ────────────────────────────────────────────────────
 async function startCall(){
   try{
     S.localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
     S.peerConn=new RTCPeerConnection(RTC_CONFIG);
-    S.callId=genCode(); // FIX: assign callId BEFORE setLocalDescription so onicecandidate has it
+    S.callId=genCode();
     S.localStream.getTracks().forEach(t=>S.peerConn.addTrack(t,S.localStream));
     S.peerConn.ontrack=e=>{let a=document.getElementById('remote-audio');if(!a){a=ce('audio');a.id='remote-audio';a.autoplay=true;document.body.appendChild(a);}a.srcObject=e.streams[0];};
-    // FIX: use separate path rooms/ROOM/candidates/CALLID/caller
-    S.peerConn.onicecandidate=e=>{
-      if(e.candidate&&S.callId)
-        db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).push(e.candidate.toJSON());
-    };
+    S.peerConn.onicecandidate=e=>{if(e.candidate&&S.callId)db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).push(e.candidate.toJSON());};
     const offer=await S.peerConn.createOffer(); await S.peerConn.setLocalDescription(offer);
     await db.ref(`rooms/${S.room}/call`).set({callId:S.callId,caller:S.uid,callerName:S.name,offer:{type:offer.type,sdp:offer.sdp},status:'calling'});
     S.inCall=true; $('call-panel').classList.remove('hidden'); $('call-status').textContent='Calling…';
@@ -1238,10 +1139,7 @@ async function handleCallSignal(data){
   if(data.status==='answered'&&S.inCall&&data.answer&&S.peerConn){
     await S.peerConn.setRemoteDescription(new RTCSessionDescription(data.answer));
     $('call-status').textContent=`In call with ${data.calleeName||'user'}`;
-    // FIX: use on('child_added') not .once() so we catch late-arriving candidates
-    db.ref(`rooms/${S.room}/candidates/${data.callId}/callee`).on('child_added',snap=>{
-      S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});
-    });
+    db.ref(`rooms/${S.room}/candidates/${data.callId}/callee`).on('child_added',snap=>{S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});});
   }
   if(data.status==='ended') endCall(false);
 }
@@ -1253,30 +1151,19 @@ async function answerCall(){
     S.peerConn=new RTCPeerConnection(RTC_CONFIG);
     S.localStream.getTracks().forEach(t=>S.peerConn.addTrack(t,S.localStream));
     S.peerConn.ontrack=e=>{let a=document.getElementById('remote-audio');if(!a){a=ce('audio');a.id='remote-audio';a.autoplay=true;document.body.appendChild(a);}a.srcObject=e.streams[0];};
-    // FIX: use separate candidates path
-    S.peerConn.onicecandidate=e=>{
-      if(e.candidate&&S.callId)
-        db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).push(e.candidate.toJSON());
-    };
-    // FIX: correct order — setRemote → createAnswer → setLocal → THEN add candidates
+    S.peerConn.onicecandidate=e=>{if(e.candidate&&S.callId)db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).push(e.candidate.toJSON());};
     await S.peerConn.setRemoteDescription(new RTCSessionDescription(callData.offer));
     const answer=await S.peerConn.createAnswer();
     await S.peerConn.setLocalDescription(answer);
     await db.ref(`rooms/${S.room}/call`).update({status:'answered',callee:S.uid,calleeName:S.name,answer:{type:answer.type,sdp:answer.sdp}});
-    // FIX: listen with on('child_added') for caller's candidates
-    db.ref(`rooms/${S.room}/candidates/${callData.callId}/caller`).on('child_added',snap=>{
-      S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});
-    });
+    db.ref(`rooms/${S.room}/candidates/${callData.callId}/caller`).on('child_added',snap=>{S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});});
     S.inCall=true; $('call-panel').classList.remove('hidden'); $('call-status').textContent=`In call with ${callData.callerName}`;
   }catch(e){toast('Answer failed: '+e.message,'error');}
 }
 function rejectCall(){$('incoming-call-panel').classList.add('hidden');db.ref(`rooms/${S.room}/call`).set({status:'ended'});}
 async function endCall(notify=true){
   if(notify)await db.ref(`rooms/${S.room}/call`).set({status:'ended'});
-  if(S.callId){
-    db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).off();
-    db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).off();
-  }
+  if(S.callId){db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).off();db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).off();}
   S.peerConn?.close(); S.peerConn=null;
   S.localStream?.getTracks().forEach(t=>t.stop()); S.localStream=null;
   S.inCall=false; S.callId=null;
@@ -1310,7 +1197,7 @@ function cleanup(){
   Object.values(S.timers).forEach(clearTimeout); S.timers={};
   Object.values(S.schedTimers).forEach(clearTimeout); S.schedTimers={};
   if(S.sessInterval){clearInterval(S.sessInterval);S.sessInterval=null;}
-  S.revealed.clear(); S.msgCache={}; S.userNames={}; S.roomUsers={}; S.pinnedMsgId=null; S.replyTo=null;
+  S.revealed.clear(); S.msgCache={}; S.roomUsers={}; S.pinnedMsgId=null; S.replyTo=null;
 }
 
 // ── Chat init ──────────────────────────────────────────────────────────────
@@ -1366,6 +1253,5 @@ function initChat(){
     if(!e.target.closest('#emoji-picker-wrap')&&!e.target.closest('#btn-emoji')){$('emoji-picker-wrap')?.classList.add('hidden');$('btn-emoji')?.classList.remove('btn-active');}
     if(!e.target.closest('#schedule-panel')&&!e.target.closest('#btn-schedule'))$('schedule-panel')?.classList.add('hidden');
     if(!e.target.closest('#destruct-panel')&&!e.target.closest('#btn-destruct'))$('destruct-panel')?.classList.add('hidden');
-    if(!e.target.closest('#search-overlay')) {/* search manages its own close */}
   });
 }
