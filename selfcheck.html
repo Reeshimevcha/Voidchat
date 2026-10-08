@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>VoidChat self-check</title>
+<style>body{font-family:monospace;background:#000;color:#0f4;padding:20px;white-space:pre-wrap}.f{color:#f44}</style>
+</head>
+<body><div id="out">running…</div>
+
+<script src="sanitize.js"></script>
+<script src="cipher.js"></script>
+<script>
+const log=[]; let fails=0;
+const ok=(cond,what)=>{ if(!cond)fails++; log.push((cond?'  ok  ':' FAIL ')+what); };
+
+// ── esc ──────────────────────────────────────────────────────────────────────
+ok(esc(`<img src=x onerror=alert(1)>`)==='&lt;img src=x onerror=alert(1)&gt;','esc closes tags');
+ok(esc(`"`)==='&quot;','esc handles double quote');
+ok(esc(`'`)==='&#39;','esc handles single quote');      // was missing before
+ok(esc(null)==='' && esc(7)==='7','esc coerces non-strings');
+
+// ── jsArg: must survive HTML entity decoding, then JS parsing ────────────────
+// The payload that broke out of onclick="f('…')" when only esc() was applied.
+const entityDecode = s => s.replace(/&#39;/g,"'").replace(/&quot;/g,'"')
+  .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+const noBareQuote = s => !/(^|[^\\])'/.test(s);
+for(const payload of [`');alert(1);//`, `\\'`, `a'b`, `''`, `\\\\'`]){
+  ok(noBareQuote(entityDecode(jsArg(payload))), `jsArg escapes every quote in ${JSON.stringify(payload)}`);
+}
+ok(jsArg(`a'b`)===`a\\&#39;b`,'jsArg escapes quote for JS then HTML');
+ok(jsArg(`a\\b`)===`a\\\\b`,'jsArg doubles backslash');
+ok(!jsArg("a\nb").includes('\n'),'jsArg strips newlines');
+ok(!jsArg('<script>').includes('<'),'jsArg still HTML-escapes');
+
+// ── safeMedia ────────────────────────────────────────────────────────────────
+const goodImg='data:image/png;base64,iVBORw0KGgo=';
+ok(safeMedia(goodImg,'image')===goodImg,'safeMedia passes our own data URL');
+ok(safeMedia('data:text/html;base64,PHNjcmlwdD4=','image')==='','safeMedia rejects text/html');
+ok(safeMedia('javascript:alert(1)','image')==='','safeMedia rejects javascript:');
+ok(safeMedia('https://evil.example/x.png','image')==='','safeMedia rejects remote URLs');
+ok(safeMedia(`data:image/png;base64,aa" onerror="alert(1)`,'image')==='','safeMedia rejects attribute breakout');
+ok(safeMedia(null,'image')===''&&safeMedia(123,'image')==='','safeMedia rejects non-strings');
+ok(safeMedia('data:audio/webm;base64,aaaa','audio')!=='','safeMedia passes audio when asked');
+ok(safeMedia('data:audio/webm;base64,aaaa','image')==='','safeMedia enforces the kind');
+
+// ── safeDecode ───────────────────────────────────────────────────────────────
+ok(safeDecode('%E2%9D%A4')==='❤','safeDecode decodes');
+ok(safeDecode('%ZZ')==='%ZZ','safeDecode survives malformed input');
+
+// ── cipher round trip + tamper detection ─────────────────────────────────────
+(async()=>{
+  const msg='hello 🔐 void', room='X7KQ2M', id='-Nabc123';
+  const ct=await EmojiCipher.encrypt(msg,room,id);
+  ok(ct!==msg && ct.length>0,'encrypt produces ciphertext');
+  ok(!ct.includes('hello'),'ciphertext does not contain plaintext');
+  ok(await EmojiCipher.decrypt(ct,room,id)===msg,'round trip');
+  ok(await EmojiCipher.decrypt(ct,'WRONG1',id)==='🔒','wrong room key fails closed');
+  ok(await EmojiCipher.decrypt(ct,room,'other-id')==='🔒','wrong message id fails closed');
+  const ct2=await EmojiCipher.encrypt(msg,room,id);
+  ok(ct!==ct2,'random IV: same plaintext encrypts differently');
+
+  // encrypt must NOT fall back to returning plaintext
+  let threw=false;
+  try{ await EmojiCipher.encrypt('secret',null,id); }catch{ threw=true; }
+  ok(threw,'encrypt throws instead of silently returning plaintext');
+
+  document.getElementById('out').innerHTML =
+    log.map(l=>l.startsWith(' FAIL')?`<span class="f">${l}</span>`:l).join('\n') +
+    `\n\n${fails===0?'ALL PASS':fails+' FAILED'} (${log.length} checks)`;
+})();
+</script>
+</body>
+</html>
