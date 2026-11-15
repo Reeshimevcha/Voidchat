@@ -20,3 +20,21 @@ const safeMedia = (url, kind) =>
   typeof url === 'string' && url.length <= 7.3e6 &&
   new RegExp('^data:' + kind + '/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}$').test(url)
     ? url : '';
+
+// Highlight every occurrence of q inside text for search results.
+// Decrypted plaintext is attacker-controlled (any member can send it), so EVERY
+// segment — match and remainder alike — is HTML-escaped before it can reach
+// innerHTML. Never build this with a bare String.replace + <mark>.
+const highlightEsc = (text, q) => {
+  text = String(text ?? ''); q = String(q ?? '');
+  if (!q) return esc(text);
+  const lt = text.toLowerCase(), lq = q.toLowerCase();
+  let out = '', i = 0;
+  for (;;) {
+    const idx = lt.indexOf(lq, i);
+    if (idx === -1) { out += esc(text.slice(i)); break; }
+    out += esc(text.slice(i, idx)) + '<mark>' + esc(text.slice(idx, idx + lq.length)) + '</mark>';
+    i = idx + lq.length;
+  }
+  return out;
+};
