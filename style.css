@@ -1,5 +1,5 @@
 /* VoidChat v4 — SOC Terminal + All New Features */
-@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700;900&family=Rajdhani:wght@500;600;700&display=swap');
+@import url('fonts.css');
 
 :root {
   --bg0:#000; --bg1:#020902; --bg2:#050f05; --bg3:#071407; --bg4:#0a1a0a;
@@ -633,3 +633,58 @@ mark{background:rgba(0,255,65,.25);color:var(--g1);border-radius:1px;padding:0 1
 
 /* Existing hidden override with display:none */
 .hidden{display:none!important;}
+
+/* ── SCREEN PROTECTION: privacy curtain + forensic watermark ─── */
+/* Curtain: z-index 99998 puts it above every in-app layer (screens, sidebar,
+   search overlay, lightbox, rx-picker) while toasts at 99999 stay visible. */
+.privacy-curtain{
+  position:fixed;inset:0;z-index:99998;background:#000;
+  display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px;text-align:center;
+}
+.privacy-curtain.on{display:flex;}
+.pc-icon{font-size:46px;line-height:1;}
+.pc-title{font-family:'Orbitron',monospace;font-size:13px;letter-spacing:4px;color:#00ff41;}
+.pc-sub{font-size:11px;letter-spacing:1px;color:#4f4;}
+.pc-id{font-size:10px;color:#2f2;letter-spacing:1px;word-break:break-all;margin-top:4px;}
+
+/* Tiled viewer-identity watermark: capture cannot be blocked, so every frame
+   carries name + uid + room — leaks are attributable to a specific viewer. */
+.watermark-layer{position:fixed;inset:0;z-index:9000;pointer-events:none;overflow:hidden;display:none;}
+.watermark-layer.on{display:block;animation:wm-drift 45s ease-in-out infinite alternate;}
+.wm-cell{
+  position:absolute;white-space:nowrap;transform:rotate(-22deg);
+  font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;
+  color:rgba(0,255,65,.10);text-shadow:0 0 3px rgba(0,0,0,.6);
+}
+@keyframes wm-drift{from{transform:translate(0,0)}to{transform:translate(-40px,-30px)}}
+
+/* Casual-copy locks on rendered chat content (inputs stay selectable). */
+#messages-list .msg-wrap,#messages-list .msg-content,#search-results .sr-item{
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+}
+#messages-list img,#lightbox img{-webkit-user-drag:none;}
+.sr-text mark{background:rgba(0,255,65,.18);color:#0f4;border-radius:1px;}
+
+/* ── PHASE 4: TRUST / SAFETY NUMBERS ───────────────────────────────────── */
+.key-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(0,255,65,.06);}
+.key-btn{margin-left:auto;background:transparent;border:1px solid var(--bd2);color:var(--g1);font-family:inherit;font-size:10px;padding:4px 7px;border-radius:4px;cursor:pointer;}
+.key-btn:hover{border-color:var(--bd3);background:rgba(0,255,65,.06);}
+.key-alarm{position:fixed;top:0;left:0;right:0;z-index:99996;display:flex;align-items:center;gap:10px;padding:9px 14px;background:rgba(40,20,0,.97);border-bottom:1px solid var(--a1);color:var(--a1);font-size:11px;letter-spacing:.6px;cursor:pointer;animation:fadeIn .2s var(--ease);}
+.key-alarm .ka-ic{font-size:14px;}
+.key-alarm .ka-go{margin-left:auto;font-size:10px;opacity:.8;}
+.key-modal{position:fixed;inset:0;z-index:99996;display:flex;align-items:center;justify-content:center;padding:18px;}
+.key-modal .km-bg{position:absolute;inset:0;background:rgba(0,0,0,.78);}
+.key-modal .km-card{position:relative;width:100%;max-width:420px;background:var(--bg2);border:1px solid var(--bd3);border-radius:10px;padding:16px 18px;box-shadow:0 0 40px rgba(0,255,65,.12);}
+.km-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+.km-title{font-family:'Orbitron',monospace;font-size:12px;letter-spacing:1.4px;color:var(--g1);}
+.km-x{background:transparent;border:none;color:var(--tx2);font-size:14px;cursor:pointer;padding:2px 6px;}
+.km-x:hover{color:var(--r1);}
+.km-sub{font-size:10px;color:var(--tx2);line-height:1.5;margin-bottom:10px;}
+.km-num{font-size:15px;line-height:1.9;letter-spacing:2px;color:var(--g1);text-align:center;word-spacing:6px;padding:10px 6px;border:1px dashed var(--bd2);border-radius:6px;background:rgba(0,255,65,.03);user-select:text;-webkit-user-select:text;}
+.km-fp{font-size:9px;color:var(--tx2);text-align:center;margin-top:8px;letter-spacing:1px;word-break:break-all;}
+.km-status{font-size:10px;text-align:center;margin-top:8px;letter-spacing:.6px;}
+.km-btns{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;justify-content:center;}
+.km-btn{background:transparent;border:1px solid var(--bd2);color:var(--tx);font-family:inherit;font-size:10px;letter-spacing:.8px;padding:7px 12px;border-radius:5px;cursor:pointer;}
+.km-btn:hover{border-color:var(--bd3);color:var(--g1);}
+.km-verify{border-color:rgba(0,255,65,.4);color:var(--g1);}
+.km-accept{border-color:var(--a1);color:var(--a1);}
