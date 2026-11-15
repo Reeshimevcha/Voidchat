@@ -45,6 +45,14 @@ ok(safeMedia('data:audio/webm;base64,aaaa','image')==='','safeMedia enforces the
 ok(safeDecode('%E2%9D%A4')==='❤','safeDecode decodes');
 ok(safeDecode('%ZZ')==='%ZZ','safeDecode survives malformed input');
 
+// ── highlightEsc: search results render decrypted (attacker-controlled) text ─
+ok(highlightEsc('hello world','world')==='hello <mark>world</mark>','highlightEsc marks matches');
+ok(highlightEsc('Hello','hell')==='<mark>Hell</mark>o','highlightEsc is case-insensitive');
+ok(highlightEsc('<img src=x onerror=alert(1)>','onerror').indexOf('<img')===-1,'highlightEsc never emits raw tags');
+ok(highlightEsc('a&b','&')==='a<mark>&amp;</mark>b','highlightEsc escapes inside <mark>');
+ok(highlightEsc('<b>x</b>','b')==='&lt;<mark>b</mark>&gt;x&lt;/<mark>b</mark>&gt;','highlightEsc escapes around matches');
+ok(highlightEsc(123,'2')==='1<mark>2</mark>3'&&highlightEsc(null,'x')===''&&highlightEsc('abc','')==='abc','highlightEsc coerces non-strings and empty query');
+
 // ── cipher round trip + tamper detection ─────────────────────────────────────
 (async()=>{
   const msg='hello 🔐 void', room='X7KQ2M', id='-Nabc123';
