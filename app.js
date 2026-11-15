@@ -16,7 +16,7 @@ const S = {
   name:null, room:null, type:null, isOwner:false,
   canDownload:false, myVisibleTo:null,
   roomExpires:null, listeners:[], timers:{}, schedTimers:{},
-  sessInterval:null, revealed:new Set(), globalReveal:false,
+  sessInterval:null, revealed:new Set(), globalReveal:false, pubs:{}, myPriv:null, trust:{}, keyModalUid:null,
   schedTime:null, destructSecs:0, revealSecs:0, sidebarOpen:false,
   recorder:null, recordingChunks:[], isRecording:false, recordTimer:null,
   peerConn:null, localStream:null, callId:null, inCall:false,
@@ -24,8 +24,9 @@ const S = {
   pinnedMsgId:null,
   replyTo:null,
   searchOpen:false,
-  msgCache:{},
+  msgCache:{}, sendTimes:[],
   roomUsers:{},
+  curtainOn:false, curtainToastAt:0,
 };
 
 const $ = id => document.getElementById(id);
@@ -37,7 +38,7 @@ const fmtSz = b => b<1024?`${b}B`:b<1048576?`${(b/1024).toFixed(1)}KB`:`${(b/104
 const fmtDur = ms => { const s=Math.floor(ms/1000),m=Math.floor(s/60); return m>0?`${m}m ${s%60}s`:`${s}s`; };
 const fmtSecs = s => s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m ${s%60}s`:`${Math.floor(s/3600)}h`;
 const hue = s => { let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))%360; return h; };
-const genCode = () => { const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; return Array.from(crypto.getRandomValues(new Uint8Array(6)),x=>c[x%32]).join(''); };
+const genCode = () => { const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; return Array.from(crypto.getRandomValues(new Uint8Array(10)),x=>c[x%32]).join(''); };
 const avatarBg = name => `hsl(${hue(name)},70%,45%)`;
 const avatarLetter = name => esc(String(name||'?').charAt(0).toUpperCase());
 
@@ -55,7 +56,7 @@ function showScreen(id){ document.querySelectorAll('.screen').forEach(s=>s.class
 
 document.addEventListener('DOMContentLoaded', async()=>{
   initLanding(); initChat(); initEmojiPicker(); initAttachMenu(); initVoiceNote();
-  initSearch(); initCipherVisualizer();
+  initSearch(); initCipherVisualizer(); initScreenProtection();
   try{
     const cred=await auth.signInAnonymously();
     S.uid=cred.user.uid;
@@ -71,10 +72,11 @@ async function tryRestore(){
   const sv=JSON.parse(localStorage.getItem('vc_sess')||'null'); if(!sv)return;
   try{
     const base=`rooms/${sv.room}`;
-    const [closed,expiresAt,owner,type]=await Promise.all(
+    const [closed,expiresAt,owner,type,kicked]=await Promise.all(
       ['closed','expiresAt','owner','type'].map(f=>db.ref(`${base}/${f}`).once('value').then(s=>s.val()))
+        .concat([db.ref(`${base}/users/${S.uid}/kicked`).once('value').then(s=>s.val())])
     );
-    if(owner===null||closed===true){clearSess();return;}
+    if(owner===null||closed===true||kicked===true){clearSess();return;}
     if(expiresAt&&Date.now()>expiresAt){clearSess();return;}
     S.name=sv.name; S.room=sv.room; S.type=type;
     S.isOwner=owner===S.uid;              // authoritative: from the DB, not localStorage
@@ -135,13 +137,15 @@ async function handleJoin(){
   const name=$('username-join').value.trim();
   const code=$('room-code-join').value.trim().toUpperCase();
   if(!name){toast('Enter codename','error');return;}
-  if(!/^[A-Z2-9]{6}$/.test(code)){toast('Room code must be 6 chars','error');return;}
+  if(!/^[A-Z2-9]{10}$/.test(code)){toast('Room code must be 10 chars','error');return;}
   // Read the public fields one by one: the room node itself is not readable to non-members.
   const base=`rooms/${code}`;
   const [owner,closed,expiresAt,type,maxUsers]=await Promise.all(
     ['owner','closed','expiresAt','type','maxUsers'].map(f=>db.ref(`${base}/${f}`).once('value').then(s=>s.val()))
   );
   if(owner===null){toast('Room not found','error');return;}
+  const kicked=(await db.ref(`${base}/users/${S.uid}/kicked`).once('value')).val();
+  if(kicked===true){toast('You were removed from this room','error');return;}
   if(closed===true){toast('Room is closed','error');return;}
   if(expiresAt&&Date.now()>expiresAt){toast('Room expired','error');return;}
   if(maxUsers>0){
@@ -158,14 +162,250 @@ async function handleJoin(){
 // ── Enter Chat ─────────────────────────────────────────────────────────────
 function enterChat(){
   showScreen('screen-chat');
+  curtainOff(); buildWatermark();
   $('chat-room-code').textContent=S.room;
   $('sb-room-code').textContent=S.room;
   $('room-type-badge').textContent=S.type==='duo'?'⚡ DUO':'◈ GROUP';
   $('btn-permissions').classList.toggle('hidden',!(S.isOwner&&S.type==='group'));
   $('btn-close-room').classList.toggle('hidden',!S.isOwner);
   listenRoom();
+  initKeys();
   if(S.roomExpires) startSessTimer();
 }
+
+// ── Per-user keys (envelope encryption) ────────────────────────────────────
+// Each member publishes an ECDH P-256 public key in the room key directory and
+// keeps the private half in an owner-only vault. Restricted messages wrap their
+// per-message key to these public keys — unlisted members cannot unwrap them.
+// The identity keypair lives on THIS device only. A database dump must not
+// contain anything that decrypts history.
+function localIdentity(){
+  try{return JSON.parse(localStorage.getItem('vc_identity')||'null');}catch{return null;}
+}
+function saveIdentity(id){
+  try{localStorage.setItem('vc_identity',JSON.stringify(id));}catch(e){console.error('saveIdentity failed',e);}
+}
+async function initKeys(){
+  trustLoad();
+  try{
+    let id=localIdentity();
+    if(!id){
+      // One-time migration: older builds stored the private key in the database
+      // (owner-only, but a dump would include it). Move it here, delete the copy.
+      const [legacyPub,legacyPriv]=await Promise.all([
+        db.ref(`keys/${S.room}/${S.uid}/pub`).once('value'),
+        db.ref(`vault/${S.room}/${S.uid}/priv`).once('value')
+      ]);
+      const lp=legacyPub.val(), lk=legacyPriv.val();
+      id=(lp&&lk)?{pub:lp,priv:lk}:await Envelope.genKeypair();
+      saveIdentity(id);
+      if(lk) db.ref(`vault/${S.room}/${S.uid}/priv`).remove().catch(()=>{});
+    }
+    S.myPriv=id.priv; S.pubs[S.uid]=id.pub;
+    // Republish the public half every session (idempotent; heals a wiped key node).
+    const pubSnap=await db.ref(`keys/${S.room}/${S.uid}/pub`).once('value');
+    if(pubSnap.val()!==id.pub) await db.ref(`keys/${S.room}/${S.uid}/pub`).set(id.pub);
+  }catch(e){console.error('initKeys failed',e);}
+  // Cache every member's public key; late joiners appear here too.
+  const kRef=db.ref(`keys/${S.room}`);
+  const onKey=snap=>{
+    const p=snap.child('pub').val(); if(!p)return;
+    S.pubs[snap.key]=p; notePeerKey(snap.key,p); renderKeys();
+  };
+  kRef.on('child_added',onKey);
+  S.listeners.push(()=>kRef.off('child_added',onKey));
+  renderKeys();
+}
+
+// Recipients of a per-message key: the privacy list when one is set, otherwise
+// every current member — plus the sender, so they can re-read their own history.
+function recipientPubs(visList){
+  const vis=Array.isArray(visList)?visList:null;
+  const pubs={};
+  if(S.pubs[S.uid]) pubs[S.uid]=S.pubs[S.uid];
+  for(const[uid,u]of Object.entries(S.roomUsers||{})){
+    if(uid===S.uid||!u||u.kicked)continue;
+    if(vis&&!vis.includes(uid))continue;
+    if(S.pubs[uid])pubs[uid]=S.pubs[uid];
+  }
+  return pubs;
+}
+
+// ── Trust layer: safety numbers, TOFU, key-change alarms ──────────────────
+// Trust lives on this device (localStorage), per room. First sight of a peer
+// key is TOFU: remembered silently. If it ever changes, the peer is flagged
+// UNVERIFIED with a loud alarm until the user compares the new safety number
+// out-of-band and explicitly accepts it.
+function trustLoad(){
+  try{const all=JSON.parse(localStorage.getItem('vc_trust')||'{}');S.trust=all[S.room]||{};}catch{S.trust={};}
+}
+function trustSave(){
+  try{
+    const all=JSON.parse(localStorage.getItem('vc_trust')||'{}');
+    all[S.room]=S.trust; localStorage.setItem('vc_trust',JSON.stringify(all));
+  }catch(e){console.error('trustSave failed',e);}
+}
+const peerName=uid=>S.roomUsers[uid]?.name||String(uid||'').slice(0,8)+'…';
+function notePeerKey(uid,pub){
+  if(uid===S.uid)return;
+  const rec=S.trust[uid];
+  if(!rec){S.trust[uid]={pub,verified:false};trustSave();return;}
+  if(rec.pub!==pub&&rec.pending!==pub){
+    rec.pending=pub; rec.verified=false; trustSave();
+    toast(`⚠ Encryption key changed for ${peerName(uid)} — verify again`,'error');
+  }
+}
+function pendingKeys(){return Object.keys(S.trust).filter(u=>S.roomUsers[u]&&S.trust[u]&&S.trust[u].pending);}
+function updateKeyAlarm(){
+  const el=$('key-alarm'); if(!el)return;
+  const p=pendingKeys();
+  el.classList.toggle('hidden',!p.length);
+  if(p.length)$('key-alarm-text').textContent=p.length===1
+    ? `Encryption key changed for ${peerName(p[0])} — verify before trusting`
+    : `${p.length} member keys changed — verify`;
+}
+function renderKeys(){
+  const list=$('key-list'); if(!list)return;
+  list.innerHTML='';
+  let n=0;
+  const me=S.pubs[S.uid];
+  if(me){
+    const row=ce('div'); row.className='perm-row key-row';
+    row.innerHTML=`<div class="pa" style="background:${avatarBg(S.name||'?')}">${avatarLetter(S.name||'?')}</div>
+      <div class="pm"><span class="pn">YOU</span><span class="priv-status" style="color:#00d4ff;font-size:9px;display:block">YOUR KEY</span></div>
+      <button class="key-btn" ${act('openKeyModal',[S.uid])}>🔑</button>`;
+    list.appendChild(row);
+  }
+  for(const[uid,u]of Object.entries(S.roomUsers)){
+    if(!u||uid===S.uid)continue;
+    const rec=S.trust[uid]||{};
+    const st=rec.pending?'changed':(rec.verified?'verified':'unverified');
+    const label=st==='verified'?'✓ VERIFIED':st==='changed'?'⚠ CHANGED':'○ UNVERIFIED';
+    const color=st==='verified'?'#00ff41':st==='changed'?'#ffaa00':'#446644';
+    const row=ce('div'); row.className='perm-row key-row';
+    row.innerHTML=`<div class="pa" style="background:${avatarBg(u.name||'?')}">${avatarLetter(u.name||'?')}</div>
+      <div class="pm"><span class="pn">${esc(u.name||'?')}</span><span class="priv-status" style="color:${color};font-size:9px;display:block">${label}</span></div>
+      <button class="key-btn" ${act('openKeyModal',[uid])}>🔑</button>`;
+    list.appendChild(row); n++;
+  }
+  const kc=$('key-count'); if(kc)kc.textContent=n;
+  updateKeyAlarm();
+}
+async function openKeyModal(uid){
+  if(!uid)return;
+  const myPub=S.pubs[S.uid], theirPub=S.pubs[uid];
+  if(!myPub||!theirPub){toast('Keys not ready yet','error');return;}
+  S.keyModalUid=uid;
+  const rec=S.trust[uid]||{};
+  const fp=await Envelope.fingerprint(theirPub);
+  const verifyBtn=$('km-verify'), acceptBtn=$('km-accept'), num=$('km-num'), sub=$('km-sub'), st=$('km-status');
+  if(uid===S.uid){
+    $('km-title').textContent='YOUR IDENTITY KEY';
+    sub.textContent='Share this fingerprint with others through another channel so they can verify you.';
+    num.textContent=fp; $('km-fp').textContent='';
+    verifyBtn.classList.add('hidden'); acceptBtn.classList.add('hidden');
+    st.textContent=''; st.style.color='';
+  }else{
+    $('km-title').textContent=`SAFETY NUMBER — ${peerName(uid)}`;
+    sub.textContent='Compare these 60 digits with the other person through another channel. If they match, nobody is impersonating them.';
+    num.textContent=await Envelope.safetyNumber(myPub,theirPub);
+    $('km-fp').textContent=`KEY FINGERPRINT: ${fp}`;
+    if(rec.pending){
+      verifyBtn.classList.add('hidden'); acceptBtn.classList.remove('hidden');
+      st.textContent='⚠ THIS KEY CHANGED — verify the new number before accepting.';
+      st.style.color='#ffaa00';
+    }else{
+      acceptBtn.classList.add('hidden'); verifyBtn.classList.remove('hidden');
+      verifyBtn.textContent=rec.verified?'✕ MARK UNVERIFIED':'✓ MARK VERIFIED';
+      st.textContent=rec.verified?'✓ Verified on this device':'Not verified yet';
+      st.style.color=rec.verified?'#00ff41':'#446644';
+    }
+  }
+  $('key-modal').classList.remove('hidden');
+}
+function closeKeyModal(){ $('key-modal').classList.add('hidden'); S.keyModalUid=null; }
+function toggleVerifyKey(){
+  const uid=S.keyModalUid; if(!uid||uid===S.uid)return;
+  const rec=S.trust[uid]; if(!rec)return;
+  rec.verified=!rec.verified; trustSave();
+  toast(rec.verified?'✓ Key marked verified':'Key marked unverified','info');
+  openKeyModal(uid); renderKeys();
+}
+function acceptKey(){
+  const uid=S.keyModalUid; if(!uid)return;
+  const rec=S.trust[uid]; if(!rec||!rec.pending)return;
+  rec.pub=rec.pending; delete rec.pending; rec.verified=false; trustSave();
+  toast('New key accepted — verify the safety number to trust it','info');
+  openKeyModal(uid); renderKeys();
+}
+function copySafetyNumber(){
+  const t=$('km-num')?.textContent||''; if(!t||t==='—')return;
+  copyText(t.replace(/\s/g,''));
+}
+function reviewKeyAlarm(){
+  const p=pendingKeys(); if(p.length)openKeyModal(p[0]);
+}
+
+// ── UI action registry (CSP: no inline handlers anywhere) ──────────────────
+// Controls carry data-action="name" (space-separated = several calls) with an
+// optional data-args='[...]' JSON array and data-evt="input|change". Actions
+// run as fn(...args, event, element). The registry is a fixed object — never a
+// window[name] lookup — so markup cannot name arbitrary globals.
+const act=(name,args,evt)=>
+  `data-action="${name}"${args&&args.length?` data-args="${esc(JSON.stringify(args))}"`:''}${evt?` data-evt="${evt}"`:''}`;
+const ACTION_FNS={
+  closeSidebar:()=>closeSidebar(),
+  clearFile:()=>clearFile(),
+  closeInputPanels:()=>closeInputPanels(),
+  applyRevealTimer:()=>applyRevealTimer(),
+  closeLightbox:()=>closeLightbox(),
+  upperInput:(ev,el)=>{el.value=el.value.toUpperCase();},
+  autoGrow:(ev,el)=>{el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px';},
+  pinMessage:(id,ev)=>pinMessage(id,ev),
+  setReplyFrom:(id)=>setReplyFrom(id),
+  scrollToMsg:(id)=>scrollToMsg(id),
+  toggleReveal:(id)=>toggleReveal(id),
+  openLightbox:(src)=>openLightbox(src),
+  toggleAudio:(id)=>toggleAudio(id),
+  votePoll:(id,opt)=>votePoll(id,opt),
+  toggleCheckItem:(id,idx)=>toggleCheckItem(id,idx),
+  doReact:(id,emoji)=>doReact(id,emoji),
+  closeRxPicker:(...a)=>{const el=a[a.length-1];if(el&&el.closest)el.closest('.rx-picker')?.remove();},
+  openRxPicker:(id,ev,el)=>openRxPicker(id,ev,el),
+  kickUser:(uid,name)=>kickUser(uid,name),
+  setPermToggle:(uid,field,ev,el)=>setPerm(uid,field,!!el.checked),
+  myVisToggle:(uid,ev,el)=>toggleMyVis(uid,!!el.checked),
+  setPollOpt:(i,ev,el)=>{S.pollOptions[i]=el.value;},
+  delPollOpt:(i)=>{S.pollOptions.splice(i,1);renderPollOptions();},
+  setCheckItem:(i,ev,el)=>{S.checkItems[i]=el.value;},
+  delCheckItem:(i)=>{S.checkItems.splice(i,1);renderCheckItems();},
+  openKeyModal:(uid)=>openKeyModal(uid),
+  closeKeyModal:()=>closeKeyModal(),
+  toggleVerifyKey:()=>toggleVerifyKey(),
+  acceptKey:()=>acceptKey(),
+  copySafetyNumber:()=>copySafetyNumber(),
+  reviewKeyAlarm:()=>reviewKeyAlarm(),
+  openBackup:()=>openBackup(),
+  closeBackup:()=>closeBackup(),
+  backupExport:()=>backupExport(),
+  backupPickFile:()=>$('backup-file').click(),
+  backupImport:()=>backupImport()
+};
+function runAction(e){
+  const t=e.target, el=t&&t.closest?t.closest('[data-action]'):null;
+  if(!el)return;
+  if((el.dataset.evt||'click')!==e.type)return;
+  let args=[]; try{args=JSON.parse(el.dataset.args||'[]');}catch{args=[];}
+  for(const name of (el.dataset.action||'').split(/\s+/).filter(Boolean)){
+    const fn=ACTION_FNS[name];
+    if(fn)fn(...args,e,el);
+  }
+}
+document.addEventListener('click',runAction);
+document.addEventListener('input',runAction);
+document.addEventListener('change',runAction);
+// Any broken <img> (including DB-supplied media) hides itself.
+document.addEventListener('error',e=>{const t=e.target;if(t&&t.tagName==='IMG')t.style.display='none';},true);
 
 // ── PRIVACY HELPERS ────────────────────────────────────────────────────────
 // Normalize Firebase value (may be object) to array or null
@@ -240,10 +480,12 @@ function listenRoom(){
       // Normalize myVisibleTo from Firebase (object vs array)
       S.myVisibleTo=normArr(me.myVisibleTo);
       $('btn-download-chat').classList.toggle('hidden',!S.canDownload);
+      $('btn-backup').classList.toggle('hidden',!S.canDownload);
     }
     renderUsers(users);
     if(S.isOwner&&S.type==='group') renderOwnerPerms(users);
     renderMyPrivacy(users);
+    renderKeys();
     // Re-check all message visibility whenever any user's privacy changes
     reRenderAllMsgVisibility();
   });
@@ -343,12 +585,12 @@ function renderOwnerPerms(users){
         <div class="ptr">
           <span class="ptl">Download</span>
           <label class="toggle-switch">
-            <input type="checkbox" ${u.canDownload?'checked':''} onchange="setPerm('${jsArg(uid)}','canDownload',this.checked)">
+            <input type="checkbox" ${u.canDownload?'checked':''} ${act('setPermToggle',[uid,'canDownload'],'change')}>
             <span class="tt"></span>
           </label>
         </div>
         <div class="ptr">
-          <button class="kick-btn" onclick="kickUser('${jsArg(uid)}','${jsArg(u.name||'user')}')">Kick</button>
+          <button class="kick-btn" ${act('kickUser',[uid,u.name||'user'])}>Kick</button>
         </div>
       </div>`;
     p.appendChild(row);
@@ -383,7 +625,7 @@ function renderMyPrivacy(users){
         <span class="priv-status" style="color:${allowed?'#00ff41':'#ff4444'};font-size:9px;display:block">${allowed?'✓ CAN READ':'🔒 BLOCKED'}</span>
       </div>
       <label class="toggle-switch">
-        <input type="checkbox" ${allowed?'checked':''} onchange="toggleMyVis('${jsArg(uid)}',this.checked)">
+        <input type="checkbox" ${allowed?'checked':''} ${act('myVisToggle',[uid],'change')}>
         <span class="tt"></span>
       </label>`;
     p.appendChild(row);
@@ -474,10 +716,15 @@ function initAttachMenu(){
   $('attach-photo').addEventListener('click',()=>{$('file-input').accept='image/*';$('file-input').click();closeInputPanels();});
   $('file-input').addEventListener('change',handleImageSelect);
 }
+function clearFile(){
+  const fp=$('file-preview'); if(fp)fp.classList.add('hidden');
+  const fi=$('file-input'); if(fi)fi.value='';
+}
 function handleImageSelect(e){
   const file=e.target.files[0]; if(!file)return;
   if(!file.type.startsWith('image/')){toast('Images only','error');return;}
   if(file.size>2*1024*1024){toast('Max 2MB for images','error');return;}
+  if(sendThrottled()){e.target.value='';return;}
   const reader=new FileReader();
   reader.onload=async()=>{
     const msgRef=db.ref(`rooms/${S.room}/messages`).push();
@@ -558,6 +805,7 @@ async function stopRecording(){
   const blob=new Blob(S.recordingChunks,{type:'audio/webm'});
   if(blob.size<1000){toast('Too short — hold longer','error');return;}
   if(blob.size>5*1024*1024){toast('Recording too long (max ~60s)','error');return;}
+  if(sendThrottled())return;
   toast('Sending voice note…','info');
   const reader=new FileReader();
   reader.onloadend=async()=>{
@@ -577,7 +825,7 @@ function renderPollOptions(){
   const c=$('poll-options-list'); c.innerHTML='';
   S.pollOptions.forEach((opt,i)=>{
     const row=ce('div'); row.className='builder-row';
-    row.innerHTML=`<input class="fi" value="${esc(opt)}" placeholder="Option ${i+1}" oninput="S.pollOptions[${i}]=this.value">${S.pollOptions.length>2?`<button class="del-btn" onclick="S.pollOptions.splice(${i},1);renderPollOptions()">✕</button>`:''}`;
+    row.innerHTML=`<input class="fi" value="${esc(opt)}" placeholder="Option ${i+1}" ${act('setPollOpt',[i],'input')}>${S.pollOptions.length>2?`<button class="del-btn" ${act('delPollOpt',[i])}>✕</button>`:''}`;
     c.appendChild(row);
   });
 }
@@ -585,6 +833,7 @@ function addPollOption(){if(S.pollOptions.length<8){S.pollOptions.push('');rende
 async function sendPoll(){
   const q=$('poll-question').value.trim(); const opts=S.pollOptions.filter(o=>o.trim());
   if(!q){toast('Enter question','error');return;} if(opts.length<2){toast('Add at least 2 options','error');return;}
+  if(sendThrottled())return;
   const msgRef=db.ref(`rooms/${S.room}/messages`).push();
   await msgRef.set({from:S.uid,fromName:S.name,timestamp:Date.now(),type:'poll',question:q,options:opts,votes:{},readBy:{[S.uid]:Date.now()},delivered:{[S.uid]:Date.now()},visibleTo:S.myVisibleTo});
   $('poll-builder').classList.add('hidden'); toast('Poll sent!','success');
@@ -596,7 +845,7 @@ function renderCheckItems(){
   const c=$('check-items-list'); c.innerHTML='';
   S.checkItems.forEach((item,i)=>{
     const row=ce('div'); row.className='builder-row';
-    row.innerHTML=`<input class="fi" value="${esc(item)}" placeholder="Item ${i+1}" oninput="S.checkItems[${i}]=this.value">${S.checkItems.length>1?`<button class="del-btn" onclick="S.checkItems.splice(${i},1);renderCheckItems()">✕</button>`:''}`;
+    row.innerHTML=`<input class="fi" value="${esc(item)}" placeholder="Item ${i+1}" ${act('setCheckItem',[i],'input')}>${S.checkItems.length>1?`<button class="del-btn" ${act('delCheckItem',[i])}>✕</button>`:''}`;
     c.appendChild(row);
   });
 }
@@ -604,6 +853,7 @@ function addCheckItem(){S.checkItems.push('');renderCheckItems();}
 async function sendChecklist(){
   const title=$('check-title').value.trim(); const items=S.checkItems.filter(i=>i.trim()).map(t=>({text:t,checked:false}));
   if(!items.length){toast('Add at least one item','error');return;}
+  if(sendThrottled())return;
   const msgRef=db.ref(`rooms/${S.room}/messages`).push();
   await msgRef.set({from:S.uid,fromName:S.name,timestamp:Date.now(),type:'checklist',title:title||'Checklist',items,readBy:{[S.uid]:Date.now()},delivered:{[S.uid]:Date.now()},visibleTo:S.myVisibleTo});
   $('check-builder').classList.add('hidden'); toast('Checklist sent!','success');
@@ -622,6 +872,7 @@ function updateChecklistUI(id,data){
 // ── Location & Contact ─────────────────────────────────────────────────────
 function shareLocation(){
   if(!navigator.geolocation){toast('Geolocation not supported','error');return;}
+  if(sendThrottled())return;
   toast('Getting location…','info');
   navigator.geolocation.getCurrentPosition(async pos=>{
     const{latitude:lat,longitude:lng}=pos.coords;
@@ -634,6 +885,7 @@ function openContactForm(){$('contact-builder').classList.remove('hidden');$('co
 async function sendContact(){
   const name=$('contact-name').value.trim(); const phone=$('contact-phone').value.trim(); const email=$('contact-email').value.trim();
   if(!name&&!phone){toast('Enter name or phone','error');return;}
+  if(sendThrottled())return;
   const msgRef=db.ref(`rooms/${S.room}/messages`).push();
   await msgRef.set({from:S.uid,fromName:S.name,timestamp:Date.now(),type:'contact',contactName:name,phone,email,readBy:{[S.uid]:Date.now()},delivered:{[S.uid]:Date.now()},visibleTo:S.myVisibleTo});
   $('contact-builder').classList.add('hidden');
@@ -641,29 +893,51 @@ async function sendContact(){
   toast('Contact shared!','success');
 }
 
+// ── Send throttle ──────────────────────────────────────────────────────────
+// RTDB rules cannot rate-limit, so every user-initiated send path (text,
+// polls, checklists, images, voice notes, location, contacts) comes through
+// here: 500 ms minimum gap, at most 10 sends per 10 seconds.
+function sendThrottled(){
+  const now=Date.now();
+  S.sendTimes=S.sendTimes.filter(t=>now-t<10000);
+  if((S.sendTimes.length&&now-S.sendTimes[S.sendTimes.length-1]<500)||S.sendTimes.length>=10){
+    toast('Slow down — max 10 messages per 10 seconds','error'); return true;
+  }
+  S.sendTimes.push(now); return false;
+}
+
 // ── Send Message ───────────────────────────────────────────────────────────
 async function handleSend(){
   const text=$('msg-input').value.trim(); if(!text)return;
+  if(sendThrottled())return;
   closeInputPanels(); $('btn-send').disabled=true;
   try{
     if(S.schedTime){
       // Encrypt at rest under the schedule's own key id; the DB never holds plaintext.
       const schedRef=db.ref(`rooms/${S.room}/scheduled`).push();
-      const content=await EmojiCipher.encrypt(text,S.room,schedRef.key);
-      await schedRef.set({
+      if(!S.myPriv||!S.pubs[S.uid]) throw new Error('keys not ready');
+      const sealed=await Envelope.seal(text,S.room,schedRef.key,S.myPriv,recipientPubs(S.myVisibleTo));
+      const content=sealed.content, wrapped=sealed.wrapped;
+      const schedPayload={
         from:S.uid, fromName:S.name,
         timestamp:S.schedTime, scheduledFor:S.schedTime,
         sent:false, content, type:'text',
         expiresAt:S.destructSecs>0?S.schedTime+S.destructSecs*1000:null,
         revealSecs:S.revealSecs, visibleTo:S.myVisibleTo
-      });
+      };
+      if(wrapped) schedPayload.wrapped=wrapped;
+      await schedRef.set(schedPayload);
       toast(`Scheduled: ${fmtDT(S.schedTime)}`,'success');
       clearSchedule(); clearDestruct();
     } else {
       const msgRef=db.ref(`rooms/${S.room}/messages`).push();
       const msgId=msgRef.key;
       await showCipherVisualizer(text);
-      const enc=await EmojiCipher.encrypt(text,S.room,msgId);
+      // Every text message gets its own random key, wrapped to the current
+      // members — a database dump holds no key that decrypts history.
+      if(!S.myPriv||!S.pubs[S.uid]) throw new Error('keys not ready');
+      const sealed=await Envelope.seal(text,S.room,msgId,S.myPriv,recipientPubs(S.myVisibleTo));
+      const enc=sealed.content, wrapped=sealed.wrapped;
       const payload={
         from:S.uid, fromName:S.name, timestamp:Date.now(),
         expiresAt:S.destructSecs>0?Date.now()+S.destructSecs*1000:null,
@@ -672,12 +946,13 @@ async function handleSend(){
         readBy:{[S.uid]:Date.now()}, delivered:{[S.uid]:Date.now()},
         type:'text', content:enc, visibleTo:S.myVisibleTo,
       };
+      if(wrapped) payload.wrapped=wrapped;
       if(S.replyTo) payload.replyTo={id:S.replyTo.id,fromName:S.replyTo.fromName};
       await msgRef.set(payload);
       clearDestruct(); clearReply();
     }
     $('msg-input').value=''; $('msg-input').style.height='auto';
-  }catch(e){toast('Send failed','error');console.error(e);}
+  }catch(e){toast(e&&e.message==='keys not ready'?'Encryption keys still loading — retry in a moment':'Send failed','error');console.error(e);}
   $('btn-send').disabled=false; $('msg-input').focus();
 }
 
@@ -689,15 +964,23 @@ function scheduleDelivery(schedId, data){
       const msgRef=db.ref(`rooms/${S.room}/messages`).push();
       const msgId=msgRef.key;
       // Re-key from the schedule id to the real message id (the emoji table is id-derived).
-      const plain=data.content ? await EmojiCipher.decrypt(data.content,S.room,schedId) : '';
+      const plain=data.content ? await decryptMsg(data,schedId) : '';
       if(!plain||plain==='🔒') throw new Error('scheduled message could not be decrypted');
-      const enc=await EmojiCipher.encrypt(plain,S.room,msgId);
+      // Re-seal for delivery under the message id (legacy entries without
+      // wrapped capsules fall back to the room key).
+      let enc, wrapped=null;
+      if(data.wrapped){
+        if(!S.myPriv||!S.pubs[S.uid]) throw new Error('keys not ready');
+        const sealed=await Envelope.seal(plain,S.room,msgId,S.myPriv,recipientPubs(data.visibleTo));
+        enc=sealed.content; wrapped=sealed.wrapped;
+      } else enc=await EmojiCipher.encrypt(plain,S.room,msgId);
       const payload={
         from:data.from, fromName:data.fromName, timestamp:Date.now(),
         expiresAt:data.expiresAt||null, revealSecs:data.revealSecs||0,
         readBy:{[S.uid]:Date.now()}, delivered:{[S.uid]:Date.now()},
         type:'text', content:enc, wasScheduled:true, visibleTo:data.visibleTo||null
       };
+      if(wrapped) payload.wrapped=wrapped;
       await msgRef.set(payload);
       await db.ref(`rooms/${S.room}/scheduled/${schedId}`).remove();
       delete S.schedTimers[schedId];
@@ -718,8 +1001,8 @@ function renderMessage(id, data){
   const timerBar=data.expiresAt?`<div class="destruct-bar" style="--dur:${Math.max(0,data.expiresAt-Date.now())}ms"></div>`:'';
   const bg=avatarBg(data.fromName||'?');
   const body=buildMessageBody(id,data,isMine,canSee);
-  const pinBtn=S.isOwner?`<button class="btn-pin-msg" onclick="pinMessage('${jsArg(id)}',event)" title="Pin message">📌</button>`:'';
-  const replyBtn=`<button class="btn-react btn-reply-msg" onclick="setReplyFrom('${jsArg(id)}')" title="Reply">↩</button>`;
+  const pinBtn=S.isOwner?`<button class="btn-pin-msg" ${act('pinMessage',[id])} title="Pin message">📌</button>`:'';
+  const replyBtn=`<button class="btn-react btn-reply-msg" ${act('setReplyFrom',[id])} title="Reply">↩</button>`;
   wrap.innerHTML=`
     <div class="ma" style="background:${bg}" title="${esc(data.fromName||'?')}">${avatarLetter(data.fromName||'?')}</div>
     <div class="mc">
@@ -740,14 +1023,14 @@ function renderMessage(id, data){
       <div class="reactions" id="rx-${esc(id)}"></div>
       <div class="mha">
         ${replyBtn}
-        <button class="btn-react" onclick="openRxPicker('${jsArg(id)}',this)">+</button>
+        <button class="btn-react" ${act('openRxPicker',[id])}>+</button>
         ${pinBtn}
       </div>
     </div>`;
   let ins=false;
   for(const ex of list.querySelectorAll('.msg-wrap')){if(parseInt(ex.dataset.ts)>data.timestamp){list.insertBefore(wrap,ex);ins=true;break;}}
   if(!ins) list.appendChild(wrap);
-  if(canSee&&data.content) autoRevealMessage(id,data);
+  if(S.globalReveal&&canSee&&data.content) autoRevealMessage(id,data);
   if(canSee) markRead(id);   // don't claim to have read what we are not allowed to see
   if(!isMine&&data.oneTimeView) handleOTV(id,data);
   list.scrollTop=list.scrollHeight;
@@ -759,7 +1042,7 @@ function renderMessage(id, data){
   if(data.reactions) updateReactions(id,data);
   // Cache for search and privacy re-renders
   S.msgCache[id]={from:data.from, fromName:data.fromName||'?', content:data.content||null,
-    visibleTo:data.visibleTo||null, type:data.type, timestamp:data.timestamp, canSee};
+    wrapped:data.wrapped||null, visibleTo:data.visibleTo||null, type:data.type, timestamp:data.timestamp, canSee};
 }
 
 function buildMessageBody(id,data,isMine,canSee){
@@ -782,7 +1065,7 @@ function buildReplyQuote(replyTo){
   const preview=(q&&q.canSee&&q.plainText)?q.plainText.slice(0,80):'[encrypted]';
   const sender=esc(replyTo.fromName||'?');
   const border=`hsl(${hue(String(replyTo.fromName||'x'))},70%,45%)`;
-  return `<div class="reply-quote" onclick="scrollToMsg('${jsArg(replyTo.id)}')" style="border-left-color:${border}">
+  return `<div class="reply-quote" ${act('scrollToMsg',[replyTo.id])} style="border-left-color:${border}">
     <span class="rq-sender">${sender}</span>
     <span class="rq-preview">${esc(preview)}</span>
   </div>`;
@@ -823,12 +1106,12 @@ function buildTextMsg(id,data,isMine,canSee){
     return `<div class="msg-content msg-encrypted-only" title="You don't have permission to read this message">${display}</div>`;
   }
   return `<div class="msg-content" id="mc-${esc(id)}" data-id="${esc(id)}" data-raw="${encodeURIComponent(data.content)}" data-state="encrypted">${display}</div>
-  <button class="btn-reveal" onclick="toggleReveal('${jsArg(id)}')">👁 REVEAL</button>`;
+  <button class="btn-reveal" ${act('toggleReveal',[id])}>👁 REVEAL</button>`;
 }
 function buildImageMsg(data){
   const src=safeMedia(data.fileUrl,'image');
   if(!src) return `<div class="msg-content">[blocked attachment]</div>`;
-  return `<div class="msg-image-wrap"><img class="msg-img" src="${esc(src)}" alt="${esc(data.fileName||'image')}" loading="lazy" onclick="openLightbox('${jsArg(src)}')" onerror="this.style.display='none'">
+  return `<div class="msg-image-wrap"><img class="msg-img" src="${esc(src)}" alt="${esc(data.fileName||'image')}" loading="lazy" draggable="false" ${act('openLightbox',[src])}>
   ${data.fileName?`<div class="img-caption">${esc(data.fileName)}</div>`:''}</div>`;
 }
 function buildVoiceMsg(data){
@@ -836,7 +1119,7 @@ function buildVoiceMsg(data){
   if(!src) return `<div class="msg-content">[blocked attachment]</div>`;
   const uid='vc-'+Math.random().toString(36).slice(2);
   return `<div class="voice-msg">
-    <button class="voice-play" onclick="toggleAudio('${uid}')">▶</button>
+    <button class="voice-play" ${act('toggleAudio',[uid])}>▶</button>
     <div class="voice-info">
       <div class="voice-wave">${Array.from({length:20},(_,i)=>`<span style="height:${Math.sin(i*0.7+1)*50+20}%"></span>`).join('')}</div>
       <span class="voice-dur">${fmtSecs(Number(data.duration)||0)}</span>
@@ -856,7 +1139,7 @@ function buildPollMsg(id,data){
     const count=Object.keys((data.votes||{})[opt]||{}).length;
     const pct=totalVotes?Math.round(count/totalVotes*100):0;
     const voted=((data.votes||{})[opt]||{})[S.uid];
-    return `<div class="poll-opt ${voted?'voted':''}" onclick="votePoll('${jsArg(id)}','${jsArg(opt)}')">
+    return `<div class="poll-opt ${voted?'voted':''}" ${act('votePoll',[id,opt])}>
       <div class="poll-bar" style="width:${pct}%"></div>
       <span class="poll-opt-text">${esc(opt)}</span>
       <span class="poll-pct">${pct}% (${count})</span>
@@ -871,7 +1154,7 @@ async function votePoll(msgId,option){
 function updatePollUI(id,data){if(data.type!=='poll')return;const el=document.querySelector(`#msg-${id} .poll-msg`);if(el){const tmp=ce('div');tmp.innerHTML=buildPollMsg(id,data);el.replaceWith(tmp.firstChild);}}
 function buildChecklistMsg(id,data){
   const items=data.items||[]; const done=items.filter(i=>i.checked).length;
-  const itemHTML=items.map((item,idx)=>`<div class="check-item ${item.checked?'done':''}"><button class="check-box" onclick="toggleCheckItem('${jsArg(id)}',${Number(idx)})">${item.checked?'☑':'☐'}</button><span>${esc(item.text)}</span></div>`).join('');
+  const itemHTML=items.map((item,idx)=>`<div class="check-item ${item.checked?'done':''}"><button class="check-box" ${act('toggleCheckItem',[id,Number(idx)])}>${item.checked?'☑':'☐'}</button><span>${esc(item.text)}</span></div>`).join('');
   return `<div class="checklist-msg"><div class="check-header">☑ ${esc(data.title||'Checklist')} <span class="check-prog">${done}/${items.length}</span></div><div class="check-items">${itemHTML}</div></div>`;
 }
 function buildLocationMsg(data){
@@ -892,11 +1175,26 @@ function buildContactMsg(data){
   </div>`;
 }
 
+// ── Decrypt (room key, or per-message envelope key) ────────────────────────
+async function decryptMsg(data,id){
+  if(!data||!data.content)return '';
+  if(data.wrapped&&data.wrapped[S.uid]){
+    if(!S.myPriv)return '🔒';
+    const senderPub=S.pubs[data.from];
+    if(!senderPub)return '🔒';
+    try{
+      const plain=await Envelope.open(data.content,data.wrapped[S.uid],S.myPriv,senderPub,S.room,id);
+      return plain||'🔒';
+    }catch{return '🔒';}
+  }
+  return EmojiCipher.decrypt(data.content,S.room,id);
+}
+
 // ── Auto-reveal ────────────────────────────────────────────────────────────
 async function autoRevealMessage(id,data){
   if(!data.content)return;
   const el=document.getElementById(`mc-${id}`); if(!el)return;
-  const plain=await EmojiCipher.decrypt(data.content,S.room,id);
+  const plain=await decryptMsg(data,id);
   if(!plain||plain==='🔒')return;
   el.textContent=plain; el.classList.add('revealed'); el.dataset.state='revealed';
   if(S.msgCache[id]) S.msgCache[id].plainText=plain;
@@ -941,7 +1239,8 @@ async function toggleReveal(id){
   }else{
     el.classList.add('decrypting');
     const raw=decodeURIComponent(el.dataset.raw||'');
-    const plain=await EmojiCipher.decrypt(raw,S.room,id);
+    const cached=S.msgCache[id]||{};
+    const plain=await decryptMsg({content:raw,wrapped:cached.wrapped,from:cached.from},id);
     el.classList.remove('decrypting');
     el.textContent=plain; el.classList.add('revealed'); S.revealed.add(id);
     if(S.msgCache[id]) S.msgCache[id].plainText=plain;
@@ -983,10 +1282,10 @@ function updateReceipts(id,data){
 
 // ── Reactions ──────────────────────────────────────────────────────────────
 const REACTS=['❤️','🔥','😂','😮','👍','🎉','🤯','💯','😢','🚀','⚡','🔐'];
-function openRxPicker(msgId,btn){
+function openRxPicker(msgId,_ev,btn){
   document.querySelectorAll('.rx-picker').forEach(p=>p.remove());
   const p=ce('div'); p.className='rx-picker';
-  p.innerHTML=REACTS.map(e=>`<button onclick="doReact('${msgId}','${e}');this.closest('.rx-picker').remove()">${e}</button>`).join('');
+  p.innerHTML=REACTS.map(e=>`<button ${act('doReact closeRxPicker',[msgId,e])}>${e}</button>`).join('');
   const rect=btn.getBoundingClientRect();
   p.style.cssText=`position:fixed;top:${Math.max(10,rect.top-60)}px;left:${Math.min(Math.max(10,rect.left-70),window.innerWidth-220)}px;z-index:9999`;
   document.body.appendChild(p); requestAnimationFrame(()=>p.classList.add('open'));
@@ -1001,7 +1300,7 @@ function updateReactions(id,data){
   for(const[e,users]of Object.entries(data.reactions||{})){
     const count=Object.keys(users).length; if(!count)continue;
     const mine=!!users[S.uid];
-    html+=`<button class="rx-chip${mine?' mine':''}" onclick="doReact('${jsArg(id)}','${jsArg(safeDecode(e))}')">${esc(safeDecode(e))}<span>${count}</span></button>`;
+    html+=`<button class="rx-chip${mine?' mine':''}" ${act('doReact',[id,safeDecode(e)])}>${esc(safeDecode(e))}<span>${count}</span></button>`;
   }
   el.innerHTML=html;
 }
@@ -1010,7 +1309,7 @@ function updateReactions(id,data){
 function openLightbox(url){
   const src=safeMedia(url,'image'); if(!src)return;
   let lb=document.getElementById('lightbox');
-  if(!lb){lb=ce('div');lb.id='lightbox';lb.className='lightbox';lb.innerHTML=`<div class="lb-bg" onclick="closeLightbox()"></div><img class="lb-img"><button class="lb-close" onclick="closeLightbox()">✕</button>`;document.body.appendChild(lb);}
+  if(!lb){lb=ce('div');lb.id='lightbox';lb.className='lightbox';lb.innerHTML=`<div class="lb-bg" ${act('closeLightbox')}></div><img class="lb-img"><button class="lb-close" ${act('closeLightbox')}>✕</button>`;document.body.appendChild(lb);}
   lb.querySelector('.lb-img').src=src; lb.classList.add('active');
 }
 function closeLightbox(){const lb=document.getElementById('lightbox');if(lb)lb.classList.remove('active');}
@@ -1115,7 +1414,7 @@ async function runSearch(){
     if(!cached||!cached.canSee)continue;
     let plain=cached.plainText||null;
     if(!plain&&cached.content){
-      plain=await EmojiCipher.decrypt(cached.content,S.room,id);
+      plain=await decryptMsg(cached,id);
       if(plain&&plain!=='🔒') cached.plainText=plain;
     }
     if(!plain)continue;
@@ -1126,33 +1425,87 @@ async function runSearch(){
   results.sort((a,b)=>b.timestamp-a.timestamp);
   res.innerHTML='';
   results.forEach(r=>{
-    const hi=r.plain.replace(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'gi'),'<mark>$1</mark>');
     const div=ce('div'); div.className='sr-item';
-    div.innerHTML=`<span class="sr-sender">${esc(r.fromName)}</span><span class="sr-time">${fmt(r.timestamp)}</span><div class="sr-text">${hi.slice(0,120)}</div>`;
+    // highlightEsc escapes every segment — decrypted plaintext is attacker-controlled.
+    div.innerHTML=`<span class="sr-sender">${esc(r.fromName)}</span><span class="sr-time">${fmt(r.timestamp)}</span><div class="sr-text">${highlightEsc(r.plain.slice(0,120),q)}</div>`;
     div.addEventListener('click',()=>{closeSearch();scrollToMsg(r.id);document.getElementById(`msg-${r.id}`)?.classList.add('search-match');});
     res.appendChild(div);
   });
+}
+
+// ── Encrypted backup (export / restore) ───────────────────────────────────
+// The readable history is exported as one file encrypted with a passphrase:
+// PBKDF2-SHA256 (600k) → AES-256-GCM. Nothing about the passphrase is stored.
+const historyRows=list=>list.map(m=>`<tr><td>${fmt(m.time)}</td><td>${esc(m.from)}</td><td>${esc(m.text||'—')}</td></tr>`).join('');
+function historyHtml(title,note,rows){
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="referrer" content="no-referrer"><title>${esc(title)}</title><style>body{font-family:monospace;background:#000;color:#00ff41;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#001400;color:#00ff41;padding:8px;text-align:left;border-bottom:2px solid #00ff41;}td{padding:8px;border-bottom:1px solid #002200;vertical-align:top;}</style></head><body><h1>🔐 ${esc(title)}</h1><p style="color:#555">${esc(note)}</p><table><thead><tr><th>TIME</th><th>FROM</th><th>MESSAGE</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+}
+async function collectHistory(){
+  const snap=await db.ref(`rooms/${S.room}/messages`).orderByChild('timestamp').once('value');
+  const msgs=[]; snap.forEach(c=>{const d=c.val();if(d)msgs.push({id:c.key,...d});});
+  const out=[];
+  for(const m of msgs){
+    if(!canView(m)) continue;
+    let text='';
+    if(m.content) text=await decryptMsg(m,m.id);
+    else if(m.type==='image') text=`[IMAGE: ${m.fileName||'image'}]`;
+    else if(m.type==='voice') text='[VOICE NOTE]';
+    else if(m.type==='poll')  text=`[POLL: ${m.question}]`;
+    else if(m.type==='location') text=`[LOCATION: ${m.lat?.toFixed(4)},${m.lng?.toFixed(4)}]`;
+    else if(m.type==='contact')  text=`[CONTACT: ${m.contactName} ${m.phone||''}]`;
+    out.push({time:m.timestamp,from:m.fromName||'?',type:m.type||'text',text});
+  }
+  return out;
+}
+function openBackup(){
+  $('backup-pass').value='';
+  const st=$('backup-status'); st.textContent=''; st.style.color='';
+  $('backup-modal').classList.remove('hidden');
+}
+function closeBackup(){ $('backup-modal').classList.add('hidden'); }
+async function backupExport(){
+  if(!S.canDownload){toast('No download permission','error');return;}
+  const pass=$('backup-pass').value, st=$('backup-status');
+  if(pass.length<8){toast('Passphrase must be at least 8 characters','error');return;}
+  st.textContent='Encrypting history…'; st.style.color='var(--tx2)';
+  try{
+    const rows=await collectHistory();
+    const payload=JSON.stringify({v:1,app:'VoidChat',room:S.room,exportedAt:Date.now(),messages:rows});
+    const data=await Envelope.backupSeal(payload,pass);
+    const file=JSON.stringify({v:1,alg:'PBKDF2-SHA256-600k|AES-256-GCM',data});
+    const a=ce('a'); a.href=URL.createObjectURL(new Blob([file],{type:'application/json'}));
+    a.download=`voidchat-${S.room}.vcbackup`; a.click();
+    st.textContent=`✓ Encrypted backup downloaded (${rows.length} messages)`;
+    st.style.color='#00ff41';
+  }catch(e){console.error(e);st.textContent='✕ Backup failed';st.style.color='#ff2244';}
+}
+async function backupImport(){
+  const picker=$('backup-file'), file=picker.files&&picker.files[0];
+  if(!file)return;
+  picker.value='';
+  const pass=$('backup-pass').value, st=$('backup-status');
+  if(pass.length<8){toast('Enter the backup passphrase first','error');return;}
+  st.textContent='Decrypting…'; st.style.color='var(--tx2)';
+  // Open the tab now: after the awaits the click gesture is gone and popup
+  // blockers would reject window.open.
+  const outWin=window.open('','_blank');
+  try{
+    const wrap=JSON.parse(await file.text());
+    if(!wrap||!wrap.data)throw new Error('not a VoidChat backup');
+    const data=JSON.parse(await Envelope.backupOpen(wrap.data,pass));
+    const html=historyHtml(`VOIDCHAT BACKUP — ${data.room||''}`,`Exported: ${new Date(data.exportedAt||0).toLocaleString()}`,historyRows(data.messages||[]));
+    const url=URL.createObjectURL(new Blob([html],{type:'text/html'}));
+    if(outWin) outWin.location=url;
+    else{const a=ce('a');a.href=url;a.download=`voidchat-backup-${data.room||'room'}.html`;a.click();}
+    st.textContent='✓ Backup opened in a new tab'; st.style.color='#00ff41';
+  }catch(e){console.error(e);if(outWin)outWin.close();st.textContent='✕ Wrong passphrase or corrupted file';st.style.color='#ff2244';}
 }
 
 // ── Download ───────────────────────────────────────────────────────────────
 async function downloadChat(){
   if(!S.canDownload){toast('No download permission','error');return;}
   toast('Preparing…','info');
-  const snap=await db.ref(`rooms/${S.room}/messages`).orderByChild('timestamp').once('value');
-  const msgs=[]; snap.forEach(c=>{const d=c.val();if(d)msgs.push({id:c.key,...d});});
-  let rows='';
-  for(const m of msgs){
-    if(!canView(m)) continue;
-    let text='';
-    if(m.content) text=await EmojiCipher.decrypt(m.content,S.room,m.id);
-    else if(m.type==='image') text=`[IMAGE: ${m.fileName||'image'}]`;
-    else if(m.type==='voice') text='[VOICE NOTE]';
-    else if(m.type==='poll')  text=`[POLL: ${m.question}]`;
-    else if(m.type==='location') text=`[LOCATION: ${m.lat?.toFixed(4)},${m.lng?.toFixed(4)}]`;
-    else if(m.type==='contact')  text=`[CONTACT: ${m.contactName} ${m.phone||''}]`;
-    rows+=`<tr><td>${fmt(m.timestamp)}</td><td>${esc(m.fromName||'?')}</td><td>${esc(text||'—')}</td></tr>`;
-  }
-  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>VoidChat — ${S.room}</title><style>body{font-family:monospace;background:#000;color:#00ff41;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#001400;color:#00ff41;padding:8px;text-align:left;border-bottom:2px solid #00ff41;}td{padding:8px;border-bottom:1px solid #002200;vertical-align:top;}</style></head><body><h1>🔐 VOIDCHAT — ${S.room}</h1><p style="color:#555">Downloaded: ${new Date().toLocaleString()}</p><table><thead><tr><th>TIME</th><th>FROM</th><th>MESSAGE</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+  const html=historyHtml(`VOIDCHAT — ${S.room}`,`Downloaded: ${new Date().toLocaleString()}`,historyRows(await collectHistory()));
   const a=ce('a'); a.href=URL.createObjectURL(new Blob([html],{type:'text/html'})); a.download=`voidchat-${S.room}.html`; a.click();
   toast('Downloaded!','success');
 }
@@ -1242,7 +1595,74 @@ function cleanup(){
   Object.values(S.timers).forEach(clearTimeout); S.timers={};
   Object.values(S.schedTimers).forEach(clearTimeout); S.schedTimers={};
   if(S.sessInterval){clearInterval(S.sessInterval);S.sessInterval=null;}
-  S.revealed.clear(); S.msgCache={}; S.roomUsers={}; S.pinnedMsgId=null; S.replyTo=null;
+  S.revealed.clear(); S.msgCache={}; S.roomUsers={}; S.pubs={}; S.myPriv=null; S.trust={}; S.keyModalUid=null; S.sendTimes=[]; S.pinnedMsgId=null; S.replyTo=null;
+  $('key-modal')?.classList.add('hidden'); $('key-alarm')?.classList.add('hidden'); $('backup-modal')?.classList.add('hidden');
+  stopWatermark(); curtainOff();
+}
+
+// ── SCREEN PROTECTION ─────────────────────────────────────────────────────
+// No web API can block an OS-level screenshot (Print Screen, Win+Shift+S,
+// Cmd+Shift+3/4, phone buttons): capture happens below the browser sandbox.
+// These layers are deterrence and best-effort detection instead:
+//   1. privacy curtain   — re-hide ALL plaintext the moment focus is lost
+//   2. capture warning   — tell the user why the screen went dark
+//   3. forensic watermark — every frame carries the viewer's identity
+//   4. copy locks        — context menu / selection / drag of chat content
+const chatActive = () => !!$('screen-chat') && $('screen-chat').classList.contains('active');
+
+function hideAllRevealed(){
+  for(const id of [...S.revealed]){
+    const el=document.getElementById(`mc-${id}`);
+    if(el){
+      const raw=decodeURIComponent(el.dataset.raw||'');
+      el.textContent=EmojiCipher.shortDisplay(raw);
+      el.classList.remove('revealed','reveal-timer');
+      el.dataset.state='encrypted';
+      const b=el.nextElementSibling; if(b&&b.classList.contains('btn-reveal'))b.textContent='👁 REVEAL';
+    }
+    S.revealed.delete(id);
+  }
+}
+function buildWatermark(){
+  const el=$('watermark-layer'); if(!el||!S.room)return;
+  // Attribution only — the room code is deliberately NOT included: a screenshot
+  // must not hand the room code to whoever sees the image.
+  const idt=`VoidChat · ${S.name||'?'} · ${String(S.uid||'').slice(0,8)}`;
+  el.textContent='';
+  const cols=Math.ceil(window.innerWidth/300)+2, rows=Math.ceil(window.innerHeight/96)+2;
+  const frag=document.createDocumentFragment();
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+    const s=ce('span'); s.className='wm-cell';
+    s.style.left=(c*300-120)+'px'; s.style.top=(r*96-70)+'px';
+    s.textContent=idt; frag.appendChild(s);
+  }
+  el.appendChild(frag); el.classList.add('on');
+}
+function stopWatermark(){ $('watermark-layer')?.classList.remove('on'); }
+function curtainOn(){
+  if(!chatActive()||S.curtainOn)return;
+  S.curtainOn=true;
+  hideAllRevealed();
+  const c=$('privacy-curtain');
+  if(c){ const i=$('pc-id'); if(i)i.textContent=`${S.name||''} · ${String(S.uid||'').slice(0,8)} · ${S.room||''}`; c.classList.add('on'); }
+  const now=Date.now();
+  if(!S.curtainToastAt||now-S.curtainToastAt>5000){ S.curtainToastAt=now; toast('⚠ Privacy curtain engaged — messages hidden'); }
+}
+function curtainOff(){ if(!S.curtainOn)return; S.curtainOn=false; $('privacy-curtain')?.classList.remove('on'); }
+function initScreenProtection(){
+  document.addEventListener('visibilitychange',()=>{ document.visibilityState==='hidden'?curtainOn():curtainOff(); });
+  window.addEventListener('blur',curtainOn);
+  window.addEventListener('focus',curtainOff);
+  document.addEventListener('contextmenu',e=>{ if(chatActive()&&!e.target.closest('input,textarea'))e.preventDefault(); });
+  document.addEventListener('copy',e=>{
+    if(!chatActive())return;
+    const sel=window.getSelection(); const n=sel?sel.anchorNode:null;
+    const node=n&&n.nodeType===3?n.parentNode:n;
+    if(node&&node.closest&&node.closest('#messages-list,#search-results,#lightbox')){ e.preventDefault(); toast('Copying disabled in secure view','info'); }
+  });
+  document.addEventListener('dragstart',e=>{ if(chatActive()&&e.target.closest('#messages-list,#lightbox'))e.preventDefault(); });
+  let wmRT=null;
+  window.addEventListener('resize',()=>{ if(!chatActive()||!S.room)return; clearTimeout(wmRT); wmRT=setTimeout(buildWatermark,300); });
 }
 
 // ── Chat init ──────────────────────────────────────────────────────────────
@@ -1273,7 +1693,7 @@ function initChat(){
     S.globalReveal=e.target.checked;
     if(S.globalReveal) document.querySelectorAll('.msg-content:not(.revealed)').forEach(el=>{
       const id=el.dataset.id,raw=decodeURIComponent(el.dataset.raw||'');
-      if(id&&raw){EmojiCipher.decrypt(raw,S.room,id).then(p=>{
+      if(id&&raw){const cached=S.msgCache[id]||{};decryptMsg({content:raw,wrapped:cached.wrapped,from:cached.from},id).then(p=>{
         if(p&&p!=='🔒'){
           el.textContent=p; el.classList.add('revealed'); S.revealed.add(id);
           if(S.msgCache[id]) S.msgCache[id].plainText=p;
