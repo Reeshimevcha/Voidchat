@@ -3,13 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!-- Defence-in-depth for the remaining inline handlers. If the app fails to load,
-       check the console for a blocked host and add it to connect-src. -->
+  <!-- Never leak the page URL/referrer to third parties. -->
+  <meta name="referrer" content="no-referrer">
+  <!-- No inline script and no inline event handlers: every control is wired from
+       app.js through the data-action registry. If the app fails to load, check
+       the console for a blocked host and add it to connect-src. -->
   <meta http-equiv="Content-Security-Policy" content="
     default-src 'self';
-    script-src 'self' https://www.gstatic.com 'unsafe-inline';
-    style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-    font-src 'self' https://fonts.gstatic.com;
+    script-src 'self' https://www.gstatic.com;
+    style-src 'self' 'unsafe-inline';
+    font-src 'self';
     img-src 'self' data:;
     media-src 'self' data: blob:;
     connect-src 'self' https://*.firebaseio.com wss://*.firebaseio.com https://*.firebasedatabase.app wss://*.firebasedatabase.app https://*.googleapis.com;
@@ -72,7 +75,7 @@
         <div class="field"><label class="fl">OPERATOR CODENAME</label>
           <input class="fi" id="username-join" type="text" placeholder="Enter alias..." maxlength="20" autocomplete="off"></div>
         <div class="field"><label class="fl">CHANNEL ACCESS CODE</label>
-          <input class="fi code-fi" id="room-code-join" type="text" placeholder="X7KQ2M" maxlength="6" autocomplete="off" oninput="this.value=this.value.toUpperCase()"></div>
+          <input class="fi code-fi" id="room-code-join" type="text" placeholder="X7KQ2M9PLZ" maxlength="10" autocomplete="off" data-action="upperInput" data-evt="input"></div>
         <div class="info-box"><span>ℹ</span><span>You join encrypted. Messages appear as emoji cipher until revealed.</span></div>
         <button class="btn-prim" id="btn-join">▶ CONNECT TO CHANNEL</button>
       </div>
@@ -91,7 +94,7 @@
   <aside id="sidebar" class="sidebar">
     <div class="sb-head">
       <div class="sb-logo">VOID<span>CHAT</span></div>
-      <button class="sb-x" onclick="closeSidebar()">✕</button>
+      <button class="sb-x" data-action="closeSidebar">✕</button>
     </div>
 
     <button class="room-pill" id="btn-copy-code">
@@ -127,6 +130,12 @@
     </div>
 
     <div class="sb-sect">
+      <div class="sb-stitle">IDENTITY KEYS <span class="pill-n" id="key-count">0</span></div>
+      <p class="perm-sub">Compare safety numbers to verify nobody is impersonating a member.</p>
+      <div id="key-list" class="perm-list"></div>
+    </div>
+
+    <div class="sb-sect">
       <div class="sb-stitle">SETTINGS</div>
       <div class="toggle-row"><span class="tlabel">Auto-reveal messages</span>
         <label class="toggle-switch"><input type="checkbox" id="toggle-reveal"><span class="tt"></span></label></div>
@@ -140,6 +149,7 @@
       <button class="sbf-btn btn-privacy" id="btn-my-privacy">👁 MY PRIVACY</button>
       <button class="sbf-btn btn-call hidden" id="btn-voice-call">📞 VOICE CALL</button>
       <button class="sbf-btn btn-dl hidden" id="btn-download-chat">⬇ DOWNLOAD</button>
+      <button class="sbf-btn btn-dl hidden" id="btn-backup" data-action="openBackup">🔐 BACKUP</button>
       <button class="sbf-btn btn-leave" id="btn-leave">↩ DISCONNECT</button>
       <button class="sbf-btn btn-purge hidden" id="btn-close-room">☠ CLOSE &amp; PURGE</button>
     </div>
@@ -234,7 +244,7 @@
     <div class="input-area">
       <div id="file-preview" class="hidden fp-bar">
         <span>📎</span><span id="fp-name" class="fp-nm">file</span><span id="fp-size" class="fp-sz">0</span>
-        <button id="btn-clear-file" onclick="clearFile()" class="fp-x">✕</button>
+        <button id="btn-clear-file" data-action="clearFile" class="fp-x">✕</button>
       </div>
       <div id="rec-indicator" class="hidden rec-bar">
         <span class="rec-dot"></span> RECORDING <span id="rec-time">0s</span>
@@ -255,7 +265,7 @@
         <input class="fi" id="sched-dt" type="datetime-local">
         <div class="popup-btns">
           <button class="pop-apply" id="btn-apply-schedule">✓ SET</button>
-          <button class="pop-cancel" onclick="closeInputPanels()">✕</button>
+          <button class="pop-cancel" data-action="closeInputPanels">✕</button>
         </div>
       </div>
       <div id="destruct-panel" class="hidden input-popup">
@@ -273,8 +283,8 @@
         </select>
         <div class="popup-btns">
           <button class="pop-apply" id="btn-apply-destruct">✓ SET</button>
-          <button class="pop-cancel" id="btn-apply-reveal" onclick="applyRevealTimer();closeInputPanels()">REVEAL ✓</button>
-          <button class="pop-cancel" onclick="closeInputPanels()">✕</button>
+          <button class="pop-cancel" id="btn-apply-reveal" data-action="applyRevealTimer closeInputPanels">REVEAL ✓</button>
+          <button class="pop-cancel" data-action="closeInputPanels">✕</button>
         </div>
       </div>
 
@@ -297,7 +307,7 @@
         <button class="ia-btn" id="btn-destruct" title="Timer">💣</button>
         <textarea id="msg-input" rows="1"
           placeholder="Type encrypted message… (Enter ↵ to send)"
-          oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea>
+          data-action="autoGrow" data-evt="input"></textarea>
         <button class="ia-btn voice-btn" id="btn-voice-note" title="Hold to record 🎙">🎙</button>
         <button id="btn-send" class="send-btn">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -327,15 +337,67 @@
 
 <!-- Lightbox -->
 <div id="lightbox" class="lightbox">
-  <div class="lb-bg" onclick="closeLightbox()"></div>
-  <img class="lb-img" alt="">
-  <button class="lb-close" onclick="closeLightbox()">✕</button>
+  <div class="lb-bg" data-action="closeLightbox"></div>
+  <img class="lb-img" alt="" draggable="false">
+  <button class="lb-close" data-action="closeLightbox">✕</button>
 </div>
 
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-storage-compat.js"></script>
+<!-- ENCRYPTED BACKUP MODAL -->
+<div id="backup-modal" class="key-modal hidden">
+  <div class="km-bg" data-action="closeBackup"></div>
+  <div class="km-card">
+    <div class="km-head"><span class="km-title">🔐 ENCRYPTED BACKUP</span>
+      <button class="km-x" data-action="closeBackup">✕</button></div>
+    <div class="km-sub">Exports this room's readable history as one file encrypted with your passphrase (PBKDF2-SHA256 600k → AES-256-GCM). The passphrase never leaves this device — without it the file cannot be recovered.</div>
+    <input class="fi" id="backup-pass" type="password" placeholder="Passphrase (min 8 characters)" autocomplete="new-password">
+    <div class="km-btns">
+      <button class="km-btn km-verify" data-action="backupExport">⬇ EXPORT .VCBACKUP</button>
+      <button class="km-btn km-accept" data-action="backupPickFile">⬆ OPEN BACKUP</button>
+    </div>
+    <input type="file" id="backup-file" accept=".vcbackup,application/json" class="hidden" data-action="backupImport" data-evt="change">
+    <div class="km-status" id="backup-status"></div>
+  </div>
+</div>
+
+<!-- KEY-CHANGE ALARM -->
+<div id="key-alarm" class="key-alarm hidden" data-action="reviewKeyAlarm" role="alert">
+  <span class="ka-ic">⚠</span><span class="ka-tx" id="key-alarm-text">A member's encryption key changed</span><span class="ka-go">REVIEW ▸</span>
+</div>
+
+<!-- SAFETY-NUMBER MODAL -->
+<div id="key-modal" class="key-modal hidden">
+  <div class="km-bg" data-action="closeKeyModal"></div>
+  <div class="km-card">
+    <div class="km-head"><span class="km-title" id="km-title">SAFETY NUMBER</span>
+      <button class="km-x" data-action="closeKeyModal">✕</button></div>
+    <div class="km-sub" id="km-sub">Compare these digits with the other person through another channel.</div>
+    <div class="km-num" id="km-num">—</div>
+    <div class="km-fp" id="km-fp"></div>
+    <div class="km-status" id="km-status"></div>
+    <div class="km-btns">
+      <button class="km-btn km-verify" id="km-verify" data-action="toggleVerifyKey">✓ MARK VERIFIED</button>
+      <button class="km-btn km-accept hidden" id="km-accept" data-action="acceptKey">⚠ ACCEPT NEW KEY</button>
+      <button class="km-btn km-copy" data-action="copySafetyNumber">📋 COPY</button>
+    </div>
+  </div>
+</div>
+
+<!-- SCREEN PROTECTION — body-level (after the lightbox) so both layers stack
+     above every screen, sidebar, search overlay and lightbox at runtime. -->
+<div id="watermark-layer" class="watermark-layer" aria-hidden="true"></div>
+<div id="privacy-curtain" class="privacy-curtain" aria-hidden="true">
+  <div class="pc-icon">🔐</div>
+  <div class="pc-title">SCREEN PROTECTION ACTIVE</div>
+  <div class="pc-sub">Window lost focus — messages re-hidden</div>
+  <div class="pc-id" id="pc-id"></div>
+</div>
+
+<!-- SRI pins these scripts to the exact bytes fetched now: a compromised CDN
+     can no longer inject script. crossorigin is required for SRI to apply. -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js" integrity="sha384-yuGdyIzzYtOBlBG6JOWn+Ey9kpq7HocusNuxEGyyohr1eEyXpeEyehIIXC/hznw4" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js" integrity="sha384-lI+CxEx/bCvWP1b0OK13j5HTrTZP7yf1xle8TVOFq2smz6KC1RChTarRV/RHP5PP" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js" integrity="sha384-M6AmjBRXEjkdGzRN1Y94xtkmblFbYBSLkqzyZ8rPvpRM2c48nhjIRFXVvUM/VATL" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-storage-compat.js" integrity="sha384-oze9siCpFoiDBZ37lLp99ZmOMO+je1s/xtvwtbNv3NXQXLpbpfPSzZSpbT3xV9da" crossorigin="anonymous"></script>
 <script src="firebase-config.js"></script>
 <script src="sanitize.js"></script>
 <script src="cipher.js"></script>
