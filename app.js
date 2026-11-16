@@ -20,6 +20,7 @@ const S = {
   schedTime:null, destructSecs:0, revealSecs:0, sidebarOpen:false,
   recorder:null, recordingChunks:[], isRecording:false, recordTimer:null,
   peerConn:null, localStream:null, callId:null, inCall:false,
+  callTimers:{}, pendingCandidates:[], peerRole:null, peerName:null, iceRestarted:false, offCandidates:null,
   pollOptions:['',''], checkItems:[],
   pinnedMsgId:null,
   replyTo:null,
@@ -530,7 +531,7 @@ function listenRoom(){
   const closedRef=root.child('closed');
   const closedL=closedRef.on('value',snap=>{if(snap.val()===true&&!S.isOwner)forceLeave('Room was closed');});
   const callRef=root.child('call');
-  const callL=callRef.on('value',snap=>{const d=snap.val();if(d)handleCallSignal(d);});
+  const callL=callRef.on('value',snap=>{const d=snap.val();if(d)handleCallSignal(d).catch(e=>console.error('call signal failed',e));});
   S.listeners=[
     ()=>uRef.off('value',uL),
     ()=>mRef.off('child_added',mAdd),
@@ -1527,19 +1528,162 @@ async function downloadChat(){
 }
 
 // ── Voice Call (WebRTC) ────────────────────────────────────────────────────
-async function startCall(){
+// Connection lifecycle is explicit: ringing → connecting → connected, with a
+// bounded wait at every step. 'disconnected' is usually a transient network
+// flap, so it gets a grace period; 'failed' triggers one ICE restart from the
+// caller before the call is torn down with a visible reason — instead of the
+// panel hanging on "Calling…" forever with the microphone still hot.
+const CALL_RING_MS=35000, CALL_CONNECT_MS=20000, CALL_RECONNECT_MS=8000;
+
+function callTimer(name,ms,fn){
+  clearCallTimer(name);
+  S.callTimers[name]=setTimeout(()=>{ delete S.callTimers[name]; fn(); },ms);
+}
+function clearCallTimer(name){
+  if(S.callTimers[name]){ clearTimeout(S.callTimers[name]); delete S.callTimers[name]; }
+}
+function clearCallTimers(){ Object.values(S.callTimers).forEach(clearTimeout); S.callTimers={}; }
+function setCallStatus(text,kind){
+  const el=$('call-status'); if(!el)return;
+  el.textContent=text;
+  el.classList.toggle('call-warn',kind==='warn');
+  el.classList.toggle('call-error',kind==='error');
+}
+function micErrorMessage(e){
+  switch(e&&e.name){
+    case 'NotAllowedError': case 'SecurityError':
+      return 'Microphone permission denied — allow the mic and try again';
+    case 'NotFoundError': case 'DevicesNotFoundError':
+      return 'No microphone found on this device';
+    case 'NotReadableError': case 'TrackStartError':
+      return 'Microphone is in use by another app';
+    case 'OverconstrainedError':
+      return 'This microphone cannot provide audio';
+    default:
+      return 'Microphone unavailable: '+((e&&e.message)||'unknown error');
+  }
+}
+function openMic(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)
+    return Promise.reject(new Error('Voice calls need HTTPS (or localhost)'));
+  return navigator.mediaDevices.getUserMedia({audio:true,video:false});
+}
+function createPeer(role){
+  const pc=new RTCPeerConnection(RTC_CONFIG);
+  S.peerRole=role;
+  pc.ontrack=e=>{
+    let a=document.getElementById('remote-audio');
+    if(!a){a=ce('audio');a.id='remote-audio';a.autoplay=true;document.body.appendChild(a);}
+    a.srcObject=e.streams[0];
+  };
+  pc.onicecandidate=e=>{
+    if(!e.candidate||!S.callId)return;
+    db.ref(`rooms/${S.room}/candidates/${S.callId}/${role}`).push(e.candidate.toJSON())
+      .catch(err=>console.warn('ICE candidate send failed',err));
+  };
+  pc.onicecandidateerror=e=>console.warn('ICE candidate error',e.errorCode,e.url,e.errorText);
+  pc.oniceconnectionstatechange=()=>onIceState(pc);
+  pc.onconnectionstatechange=()=>{
+    if(pc!==S.peerConn)return;
+    if(pc.connectionState==='failed')failCall('Connection failed');
+  };
+  return pc;
+}
+// Candidates that arrive before setRemoteDescription cannot be added yet —
+// they are queued and flushed, never dropped (a dropped candidate pair is one
+// of the ways ICE ends up in the 'failed' state).
+function queueRemoteCandidate(cand){
+  const pc=S.peerConn; if(!pc||!S.callId||!cand)return;
+  if(!pc.remoteDescription||!pc.remoteDescription.type){ S.pendingCandidates.push(cand); return; }
+  pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e=>console.warn('ICE candidate rejected',e));
+}
+async function flushRemoteCandidates(){
+  const pc=S.peerConn; if(!pc||!pc.remoteDescription)return;
+  const queued=S.pendingCandidates; S.pendingCandidates=[];
+  for(const cand of queued){
+    try{ await pc.addIceCandidate(new RTCIceCandidate(cand)); }
+    catch(e){ console.warn('ICE candidate rejected',e); }
+  }
+}
+function listenCandidates(remoteRole,callId){
+  const ref=db.ref(`rooms/${S.room}/candidates/${callId}/${remoteRole}`);
+  const onCand=snap=>{ const c=snap.val(); if(c)queueRemoteCandidate(c); };
+  ref.on('child_added',onCand);
+  S.offCandidates=()=>ref.off('child_added',onCand);
+  S.listeners.push(S.offCandidates);
+}
+function onIceState(pc){
+  if(pc!==S.peerConn||!S.inCall)return;
+  const st=pc.iceConnectionState;
+  if(st==='connected'||st==='completed'){
+    clearCallTimers();
+    setCallStatus(S.peerName?`In call with ${S.peerName}`:'In call');
+    return;
+  }
+  if(st==='disconnected'){
+    setCallStatus('Reconnecting…','warn');
+    callTimer('reconnect',CALL_RECONNECT_MS,()=>{
+      if(S.peerConn!==pc||!S.inCall)return;
+      const now=pc.iceConnectionState;
+      if(now!=='connected'&&now!=='completed')
+        failCall(now==='failed'?'Connection failed':'Connection lost');
+    });
+    return;
+  }
+  if(st==='failed'){
+    if(S.peerRole==='caller'&&!S.iceRestarted){ restartIce(); return; }
+    failCall('Connection failed');
+  }
+}
+async function restartIce(){
+  const pc=S.peerConn; if(!pc||!S.inCall)return;
+  S.iceRestarted=true;
+  setCallStatus('Reconnecting…','warn');
+  toast('Connection lost — retrying…','info');
   try{
-    S.localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
-    S.peerConn=new RTCPeerConnection(RTC_CONFIG);
-    S.callId=genCode();
-    S.localStream.getTracks().forEach(t=>S.peerConn.addTrack(t,S.localStream));
-    S.peerConn.ontrack=e=>{let a=document.getElementById('remote-audio');if(!a){a=ce('audio');a.id='remote-audio';a.autoplay=true;document.body.appendChild(a);}a.srcObject=e.streams[0];};
-    S.peerConn.onicecandidate=e=>{if(e.candidate&&S.callId)db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).push(e.candidate.toJSON());};
-    const offer=await S.peerConn.createOffer(); await S.peerConn.setLocalDescription(offer);
+    const offer=await pc.createOffer({iceRestart:true});
+    await pc.setLocalDescription(offer);
+    await db.ref(`rooms/${S.room}/call`).update({status:'renegotiate',offer:{type:offer.type,sdp:offer.sdp}});
+    callTimer('connect',CALL_CONNECT_MS,()=>failCall('Connection failed'));
+  }catch(e){
+    console.error('ICE restart failed',e);
+    failCall('Connection failed');
+  }
+}
+function failCall(reason){
+  if(!S.inCall)return;
+  console.warn('call failed:',reason);
+  S.inCall=false;   // stop further ICE events from re-entering the failure path
+  endCall(true,reason);
+}
+async function startCall(){
+  if(S.inCall)return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    toast('Voice calls need HTTPS (or localhost)','error'); return;
+  }
+  let stream;
+  try{ stream=await openMic(); }
+  catch(e){ console.error(e); toast(micErrorMessage(e),'error'); return; }
+  S.localStream=stream;
+  try{
+    S.callId=genCode(); S.peerName=null; S.iceRestarted=false; S.pendingCandidates=[];
+    S.peerConn=createPeer('caller');
+    stream.getTracks().forEach(t=>S.peerConn.addTrack(t,stream));
+    listenCandidates('callee',S.callId);
+    const offer=await S.peerConn.createOffer();
+    await S.peerConn.setLocalDescription(offer);
     await db.ref(`rooms/${S.room}/call`).set({callId:S.callId,caller:S.uid,callerName:S.name,offer:{type:offer.type,sdp:offer.sdp},status:'calling'});
-    S.inCall=true; $('call-panel').classList.remove('hidden'); $('call-status').textContent='Calling…';
+    S.inCall=true;
+    $('call-panel').classList.remove('hidden'); setCallStatus('Calling…');
     toast('📞 Calling…','info');
-  }catch(e){toast('Call failed: '+e.message,'error');}
+    callTimer('ring',CALL_RING_MS,()=>{
+      if(S.inCall&&S.peerConn&&!S.peerConn.remoteDescription)failCall('No answer');
+    });
+  }catch(e){
+    console.error('startCall failed',e);
+    releaseCall();
+    toast('Call failed: '+(e.message||'unknown error'),'error');
+  }
 }
 async function handleCallSignal(data){
   if(!data||data.caller===S.uid)return;
@@ -1547,42 +1691,127 @@ async function handleCallSignal(data){
   if(data.status==='calling'&&!S.inCall){
     $('incoming-call-from').textContent=data.callerName||'Unknown';
     $('incoming-call-panel').classList.remove('hidden');
-    S.callId=data.callId;
+    S.callId=data.callId; S.peerName=data.callerName||'Unknown';
+    callTimer('incoming',CALL_RING_MS,()=>{
+      $('incoming-call-panel').classList.add('hidden');
+      S.callId=null; S.peerName=null;
+      toast('📞 Missed call','info');
+    });
   }
-  if(data.status==='answered'&&S.inCall&&data.answer&&S.peerConn){
-    await S.peerConn.setRemoteDescription(new RTCSessionDescription(data.answer));
-    $('call-status').textContent=`In call with ${data.calleeName||'user'}`;
-    db.ref(`rooms/${S.room}/candidates/${data.callId}/callee`).on('child_added',snap=>{S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});});
+  if(data.status==='answered'&&S.inCall&&data.answer&&S.peerConn&&S.peerRole==='caller'){
+    clearCallTimer('ring'); clearCallTimer('incoming');
+    try{
+      await S.peerConn.setRemoteDescription(new RTCSessionDescription(data.answer));
+      await flushRemoteCandidates();
+      if(data.calleeName)S.peerName=data.calleeName;
+      setCallStatus(`Connecting to ${S.peerName||'user'}…`);
+      callTimer('connect',CALL_CONNECT_MS,()=>failCall('Connection timed out'));
+    }catch(e){
+      console.error('answer apply failed',e);
+      failCall('Connection failed');
+    }
   }
-  if(data.status==='ended') endCall(false);
+  // Someone else answered: stop ringing for every other member in the room.
+  if(data.status==='answered'&&!S.inCall){
+    clearCallTimer('incoming');
+    $('incoming-call-panel').classList.add('hidden');
+    S.callId=null; S.peerName=null;
+  }
+  // Caller restarted ICE: take the fresh offer and reply with a new answer.
+  if(data.status==='renegotiate'&&S.inCall&&S.peerRole==='callee'&&S.peerConn&&data.offer){
+    try{
+      await S.peerConn.setRemoteDescription(new RTCSessionDescription(data.offer));
+      await flushRemoteCandidates();
+      const answer=await S.peerConn.createAnswer();
+      await S.peerConn.setLocalDescription(answer);
+      await db.ref(`rooms/${S.room}/call`).update({status:'answered',answer:{type:answer.type,sdp:answer.sdp}});
+      setCallStatus('Reconnecting…','warn');
+      callTimer('connect',CALL_CONNECT_MS,()=>failCall('Connection timed out'));
+    }catch(e){
+      console.error('renegotiation failed',e);
+      failCall('Connection failed');
+    }
+  }
+  if(data.status==='ended'){
+    clearCallTimer('incoming');
+    if(S.inCall) endCall(false);
+    else{
+      $('incoming-call-panel').classList.add('hidden');
+      S.callId=null; S.peerName=null;
+    }
+  }
 }
 async function answerCall(){
   $('incoming-call-panel').classList.add('hidden');
+  clearCallTimer('incoming');
+  if(S.inCall)return;
+  let callData;
+  try{ callData=(await db.ref(`rooms/${S.room}/call`).once('value')).val(); }
+  catch(e){ console.error(e); toast('Call is no longer available','error'); return; }
+  if(!callData||callData.status!=='calling'||!callData.offer||callData.caller===S.uid){
+    toast('Call is no longer available','error');
+    S.callId=null; return;
+  }
+  let stream;
+  try{ stream=await openMic(); }
+  catch(e){ console.error(e); toast(micErrorMessage(e),'error'); return; }
+  S.localStream=stream;
   try{
-    const callData=(await db.ref(`rooms/${S.room}/call`).once('value')).val();
-    S.localStream=await navigator.mediaDevices.getUserMedia({audio:true});
-    S.peerConn=new RTCPeerConnection(RTC_CONFIG);
-    S.localStream.getTracks().forEach(t=>S.peerConn.addTrack(t,S.localStream));
-    S.peerConn.ontrack=e=>{let a=document.getElementById('remote-audio');if(!a){a=ce('audio');a.id='remote-audio';a.autoplay=true;document.body.appendChild(a);}a.srcObject=e.streams[0];};
-    S.peerConn.onicecandidate=e=>{if(e.candidate&&S.callId)db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).push(e.candidate.toJSON());};
+    S.callId=callData.callId; S.iceRestarted=false; S.pendingCandidates=[];
+    S.peerConn=createPeer('callee');
+    stream.getTracks().forEach(t=>S.peerConn.addTrack(t,stream));
+    listenCandidates('caller',S.callId);
     await S.peerConn.setRemoteDescription(new RTCSessionDescription(callData.offer));
+    await flushRemoteCandidates();
     const answer=await S.peerConn.createAnswer();
     await S.peerConn.setLocalDescription(answer);
     await db.ref(`rooms/${S.room}/call`).update({status:'answered',callee:S.uid,calleeName:S.name,answer:{type:answer.type,sdp:answer.sdp}});
-    db.ref(`rooms/${S.room}/candidates/${callData.callId}/caller`).on('child_added',snap=>{S.peerConn?.addIceCandidate(new RTCIceCandidate(snap.val())).catch(()=>{});});
-    S.inCall=true; $('call-panel').classList.remove('hidden'); $('call-status').textContent=`In call with ${callData.callerName}`;
-  }catch(e){toast('Answer failed: '+e.message,'error');}
+    S.inCall=true;
+    $('call-panel').classList.remove('hidden');
+    setCallStatus(`Connecting to ${S.peerName||'caller'}…`);
+    callTimer('connect',CALL_CONNECT_MS,()=>failCall('Connection timed out'));
+  }catch(e){
+    console.error('answerCall failed',e);
+    releaseCall();
+    toast('Call failed: '+(e.message||'unknown error'),'error');
+  }
 }
-function rejectCall(){$('incoming-call-panel').classList.add('hidden');db.ref(`rooms/${S.room}/call`).set({status:'ended'});}
-async function endCall(notify=true){
-  if(notify)await db.ref(`rooms/${S.room}/call`).set({status:'ended'});
-  if(S.callId){db.ref(`rooms/${S.room}/candidates/${S.callId}/caller`).off();db.ref(`rooms/${S.room}/candidates/${S.callId}/callee`).off();}
-  S.peerConn?.close(); S.peerConn=null;
-  S.localStream?.getTracks().forEach(t=>t.stop()); S.localStream=null;
-  S.inCall=false; S.callId=null;
-  $('call-panel').classList.add('hidden'); $('incoming-call-panel').classList.add('hidden');
-  const ra=document.getElementById('remote-audio'); if(ra)ra.remove();
-  toast('Call ended','info');
+function rejectCall(){
+  $('incoming-call-panel').classList.add('hidden');
+  clearCallTimer('incoming');
+  S.callId=null; S.peerName=null;
+  endCall(true);   // tells the caller the call is over
+}
+function releaseCall(){
+  clearCallTimers();
+  if(S.offCandidates){ try{S.offCandidates();}catch(e){} S.offCandidates=null; }
+  if(S.peerConn){
+    S.peerConn.onicecandidate=null; S.peerConn.ontrack=null;
+    S.peerConn.oniceconnectionstatechange=null; S.peerConn.onconnectionstatechange=null;
+    try{S.peerConn.close();}catch(e){}
+    S.peerConn=null;
+  }
+  if(S.localStream){ S.localStream.getTracks().forEach(t=>{try{t.stop();}catch(e){}}); S.localStream=null; }
+  S.inCall=false; S.callId=null; S.peerRole=null; S.peerName=null;
+  S.iceRestarted=false; S.pendingCandidates=[];
+  $('call-panel')?.classList.add('hidden');
+  $('incoming-call-panel')?.classList.add('hidden');
+  const ra=document.getElementById('remote-audio'); if(ra){ra.srcObject=null;ra.remove();}
+  const callBtn=$('btn-voice-call');
+  if(callBtn){
+    const others=Object.entries(S.roomUsers||{}).filter(([uid,u])=>uid!==S.uid&&u&&u.online).length;
+    callBtn.classList.toggle('hidden',others===0);
+  }
+}
+async function endCall(notify=true,reason=null){
+  const wasActive=S.inCall||!!S.peerConn;
+  releaseCall();   // free the mic, audio element and panel immediately
+  if(reason) toast(reason,'error');
+  else if(wasActive) toast('Call ended','info');
+  if(notify&&S.room){
+    try{ await db.ref(`rooms/${S.room}/call`).set({status:'ended'}); }
+    catch(e){ console.warn('call end signal failed',e); }
+  }
 }
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
@@ -1607,6 +1836,7 @@ async function closeRoom(auto=false){
 }
 function forceLeave(msg){cleanup();clearSess();S.room=null;$('messages-list').innerHTML='';showScreen('screen-landing');toast(msg||'Room closed','info');}
 function cleanup(){
+  releaseCall();
   S.listeners.forEach(o=>o()); S.listeners=[];
   Object.values(S.timers).forEach(clearTimeout); S.timers={};
   Object.values(S.schedTimers).forEach(clearTimeout); S.schedTimers={};
