@@ -2003,7 +2003,7 @@ function captureBlocked(){
     if(sub)sub.textContent=prev;
     if(document.hasFocus())curtainOff();
   },1500);
-  toast('⚠ Screenshot attempt detected — messages hidden','error');
+  toast('Screenshot attempt detected — messages hidden','error');
 }
 function initScreenProtection(){
   document.addEventListener('visibilitychange',()=>{ document.visibilityState==='hidden'?curtainOn():curtainOff(); });
