@@ -200,9 +200,11 @@ async function handleCreate(){
 async function handleJoin(){
   if(!S.uid){toast('Not connected — press RETRY CONNECTION','error');return;}
   const name=$('username-join').value.trim();
-  const code=$('room-code-join').value.trim().toUpperCase();
+  // Mobile keyboards like to add spaces or dashes; strip anything that is not a
+  // letter/digit so a pasted "X7KQ-2M9PLZ" still joins.
+  const code=$('room-code-join').value.replace(/[^a-zA-Z0-9]/g,'').toUpperCase();
   if(!name){toast('Enter codename','error');return;}
-  if(!/^[A-Z2-9]{10}$/.test(code)){toast('Room code must be 10 chars','error');return;}
+  if(!/^[A-Z2-9]{10}$/.test(code)){toast('Room code is 10 letters/digits (no 0, 1, I or O)','error');return;}
   try{
     // Read the public fields one by one: the room node itself is not readable to non-members.
     const base=`rooms/${code}`;
@@ -448,7 +450,7 @@ const ACTION_FNS={
   closeInputPanels:()=>closeInputPanels(),
   applyRevealTimer:()=>applyRevealTimer(),
   closeLightbox:()=>closeLightbox(),
-  upperInput:(ev,el)=>{el.value=el.value.toUpperCase();},
+  upperInput:(ev,el)=>{el.value=el.value.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10);},
   autoGrow:(ev,el)=>{el.style.height='auto';el.style.height=Math.min(el.scrollHeight,100)+'px';},
   pinMessage:(id,ev)=>pinMessage(id,ev),
   setReplyFrom:(id)=>setReplyFrom(id),
