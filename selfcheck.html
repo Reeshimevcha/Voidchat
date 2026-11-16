@@ -1,79 +1,87 @@
-<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>VoidChat self-check</title>
-<style>body{font-family:monospace;background:#000;color:#0f4;padding:20px;white-space:pre-wrap}.f{color:#f44}</style>
-</head>
-<body><div id="out">running…</div>
-
-<script src="sanitize.js"></script>
-<script src="cipher.js"></script>
-<script>
-const log=[]; let fails=0;
-const ok=(cond,what)=>{ if(!cond)fails++; log.push((cond?'  ok  ':' FAIL ')+what); };
+/**
+ * Sanitizers for untrusted values coming out of the database.
+ * Kept in their own file so selfcheck.html can test them without booting Firebase.
+ *
+ * Loaded as a classic script before app.js, so these consts share the page's
+ * global scope. Nothing here may redeclare a name that app.js defines.
+ *
+ * Exports (used by app.js and exercised by selfcheck.html):
+ *   esc(text)            HTML-escape a value for interpolation into markup
+ *   jsArg(text)          escape a value for a quoted JS argument inside an attribute
+ *   safeMedia(url, kind) accept only our own base64 image/audio data URLs
+ *   safeDecode(text)     percent-decode a stored key, malformed input tolerated
+ *   highlightEsc(t, q)   escape text and wrap every case-insensitive match of q
+ */
 
 // ── esc ──────────────────────────────────────────────────────────────────────
-ok(esc(`<img src=x onerror=alert(1)>`)==='&lt;img src=x onerror=alert(1)&gt;','esc closes tags');
-ok(esc(`"`)==='&quot;','esc handles double quote');
-ok(esc(`'`)==='&#39;','esc handles single quote');      // was missing before
-ok(esc(null)==='' && esc(7)==='7','esc coerces non-strings');
+// HTML-escape, including the apostrophe. Coerces non-strings (DB values are not typed).
+// Fast path: most values have nothing to escape, so skip the regex pass entirely.
+const HTML_SPECIALS = /[&<>"']/;
+const HTML_ENTITIES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = s => {
+  const str = String(s ?? '');
+  return HTML_SPECIALS.test(str) ? str.replace(/[&<>"']/g, c => HTML_ENTITIES[c]) : str;
+};
 
-// ── jsArg: must survive HTML entity decoding, then JS parsing ────────────────
-// The payload that broke out of onclick="f('…')" when only esc() was applied.
-const entityDecode = s => s.replace(/&#39;/g,"'").replace(/&quot;/g,'"')
-  .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
-const noBareQuote = s => !/(^|[^\\])'/.test(s);
-for(const payload of [`');alert(1);//`, `\\'`, `a'b`, `''`, `\\\\'`]){
-  ok(noBareQuote(entityDecode(jsArg(payload))), `jsArg escapes every quote in ${JSON.stringify(payload)}`);
-}
-ok(jsArg(`a'b`)===`a\\&#39;b`,'jsArg escapes quote for JS then HTML');
-ok(jsArg(`a\\b`)===`a\\\\b`,'jsArg doubles backslash');
-ok(!jsArg("a\nb").includes('\n'),'jsArg strips newlines');
-ok(!jsArg('<script>').includes('<'),'jsArg still HTML-escapes');
+// ── jsArg ────────────────────────────────────────────────────────────────────
+// For a value placed inside onclick="f('HERE')". JS-escape FIRST, then HTML-escape:
+// the HTML parser decodes entities before JS parses the handler, so esc() alone
+// would hand a real apostrophe to the JS parser and let an attacker break out.
+// Inline handlers were removed in the Phase 3 CSP; kept because selfcheck tests it
+// and future markup may still need a JS-string-safe escaping of an attribute.
+const jsArg = s => esc(String(s ?? '')
+  .replace(/\\/g, '\\\\')
+  .replace(/'/g, "\\'")
+  .replace(/[\r\n\u2028\u2029]/g, ' '));
 
 // ── safeMedia ────────────────────────────────────────────────────────────────
-const goodImg='data:image/png;base64,iVBORw0KGgo=';
-ok(safeMedia(goodImg,'image')===goodImg,'safeMedia passes our own data URL');
-ok(safeMedia('data:text/html;base64,PHNjcmlwdD4=','image')==='','safeMedia rejects text/html');
-ok(safeMedia('javascript:alert(1)','image')==='','safeMedia rejects javascript:');
-ok(safeMedia('https://evil.example/x.png','image')==='','safeMedia rejects remote URLs');
-ok(safeMedia(`data:image/png;base64,aa" onerror="alert(1)`,'image')==='','safeMedia rejects attribute breakout');
-ok(safeMedia(null,'image')===''&&safeMedia(123,'image')==='','safeMedia rejects non-strings');
-ok(safeMedia('data:audio/webm;base64,aaaa','audio')!=='','safeMedia passes audio when asked');
-ok(safeMedia('data:audio/webm;base64,aaaa','image')==='','safeMedia enforces the kind');
+// Media is rendered, so accept only our own base64 payloads of the requested
+// top-level type. Blocks javascript:, data:text/html, remote URLs written into
+// the DB by anyone, and values that would break out of the src="…" attribute.
+const MAX_MEDIA_LEN = 7.3e6;              // matches the rules' fileUrl/voiceUrl cap
+const MEDIA_PATTERNS = new Map();         // kind → compiled RegExp (built once)
+const mediaPattern = kind => {
+  let re = MEDIA_PATTERNS.get(kind);
+  if (!re) {
+    re = new RegExp('^data:' + kind + '/[a-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}$');
+    MEDIA_PATTERNS.set(kind, re);
+  }
+  return re;
+};
+const safeMedia = (url, kind) => {
+  // kind is code-supplied, but it is interpolated into a RegExp: strip anything
+  // that is not a letter so a caller typo can never inject a pattern.
+  const k = String(kind ?? '').replace(/[^a-z]/g, '');
+  if (!k) return '';
+  return typeof url === 'string' && url.length <= MAX_MEDIA_LEN && mediaPattern(k).test(url) ? url : '';
+};
 
 // ── safeDecode ───────────────────────────────────────────────────────────────
-ok(safeDecode('%E2%9D%A4')==='❤','safeDecode decodes');
-ok(safeDecode('%ZZ')==='%ZZ','safeDecode survives malformed input');
+// Decode a percent-encoded value we stored as an object key (reactions). A
+// malformed sequence must come back unchanged instead of throwing inside a
+// render loop.
+const safeDecode = s => {
+  const str = String(s ?? '');
+  try { return decodeURIComponent(str); } catch { return str; }
+};
 
-// ── highlightEsc: search results render decrypted (attacker-controlled) text ─
-ok(highlightEsc('hello world','world')==='hello <mark>world</mark>','highlightEsc marks matches');
-ok(highlightEsc('Hello','hell')==='<mark>Hell</mark>o','highlightEsc is case-insensitive');
-ok(highlightEsc('<img src=x onerror=alert(1)>','onerror').indexOf('<img')===-1,'highlightEsc never emits raw tags');
-ok(highlightEsc('a&b','&')==='a<mark>&amp;</mark>b','highlightEsc escapes inside <mark>');
-ok(highlightEsc('<b>x</b>','b')==='&lt;<mark>b</mark>&gt;x&lt;/<mark>b</mark>&gt;','highlightEsc escapes around matches');
-ok(highlightEsc(123,'2')==='1<mark>2</mark>3'&&highlightEsc(null,'x')===''&&highlightEsc('abc','')==='abc','highlightEsc coerces non-strings and empty query');
-
-// ── cipher round trip + tamper detection ─────────────────────────────────────
-(async()=>{
-  const msg='hello 🔐 void', room='X7KQ2M', id='-Nabc123';
-  const ct=await EmojiCipher.encrypt(msg,room,id);
-  ok(ct!==msg && ct.length>0,'encrypt produces ciphertext');
-  ok(!ct.includes('hello'),'ciphertext does not contain plaintext');
-  ok(await EmojiCipher.decrypt(ct,room,id)===msg,'round trip');
-  ok(await EmojiCipher.decrypt(ct,'WRONG1',id)==='🔒','wrong room key fails closed');
-  ok(await EmojiCipher.decrypt(ct,room,'other-id')==='🔒','wrong message id fails closed');
-  const ct2=await EmojiCipher.encrypt(msg,room,id);
-  ok(ct!==ct2,'random IV: same plaintext encrypts differently');
-
-  // encrypt must NOT fall back to returning plaintext
-  let threw=false;
-  try{ await EmojiCipher.encrypt('secret',null,id); }catch{ threw=true; }
-  ok(threw,'encrypt throws instead of silently returning plaintext');
-
-  document.getElementById('out').innerHTML =
-    log.map(l=>l.startsWith(' FAIL')?`<span class="f">${l}</span>`:l).join('\n') +
-    `\n\n${fails===0?'ALL PASS':fails+' FAILED'} (${log.length} checks)`;
-})();
-</script>
-</body>
-</html>
+// ── highlightEsc ─────────────────────────────────────────────────────────────
+// Highlight every occurrence of q inside text for search results.
+// Decrypted plaintext is attacker-controlled (any member can send it), so EVERY
+// segment — match and remainder alike — is HTML-escaped before it can reach
+// innerHTML. Never build this with a bare String.replace + <mark>.
+const highlightEsc = (text, q) => {
+  text = String(text ?? ''); q = String(q ?? '');
+  if (!q) return esc(text);
+  const lt = text.toLowerCase(), lq = q.toLowerCase();
+  // Case folding changes length for a few characters (İ, ...). Offsets would
+  // desync and mis-slice the text, so fall back to plain escaping.
+  if (lt.length !== text.length || lq.length !== q.length) return esc(text);
+  let out = '', i = 0;
+  for (;;) {
+    const idx = lt.indexOf(lq, i);
+    if (idx === -1) { out += esc(text.slice(i)); return out; }
+    out += esc(text.slice(i, idx)) + '<mark>' + esc(text.slice(idx, idx + lq.length)) + '</mark>';
+    i = idx + lq.length;
+  }
+};
