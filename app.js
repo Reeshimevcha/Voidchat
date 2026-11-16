@@ -25,6 +25,7 @@ const S = {
   replyTo:null,
   searchOpen:false,
   msgCache:{}, sendTimes:[],
+  wmOn:(()=>{try{return localStorage.getItem('vc_wm')!=='0';}catch(e){return true;}})(),
   roomUsers:{},
   curtainOn:false, curtainToastAt:0,
 };
@@ -162,7 +163,7 @@ async function handleJoin(){
 // ── Enter Chat ─────────────────────────────────────────────────────────────
 function enterChat(){
   showScreen('screen-chat');
-  curtainOff(); buildWatermark();
+  curtainOff(); $('toggle-wm').checked=S.wmOn; buildWatermark();
   $('chat-room-code').textContent=S.room;
   $('sb-room-code').textContent=S.room;
   $('room-type-badge').textContent=S.type==='duo'?'⚡ DUO':'◈ GROUP';
@@ -187,25 +188,34 @@ function saveIdentity(id){
 }
 async function initKeys(){
   trustLoad();
-  try{
-    let id=localIdentity();
-    if(!id){
-      // One-time migration: older builds stored the private key in the database
-      // (owner-only, but a dump would include it). Move it here, delete the copy.
-      const [legacyPub,legacyPriv]=await Promise.all([
+  let id=localIdentity();
+  if(!id){
+    // One-time migration: older builds stored the private key in the database.
+    // Best-effort only: when the rules have not been deployed the lookup is
+    // denied, and that must never stop this device from having keys.
+    let lp=null, lk=null;
+    try{
+      const [s1,s2]=await Promise.all([
         db.ref(`keys/${S.room}/${S.uid}/pub`).once('value'),
         db.ref(`vault/${S.room}/${S.uid}/priv`).once('value')
       ]);
-      const lp=legacyPub.val(), lk=legacyPriv.val();
-      id=(lp&&lk)?{pub:lp,priv:lk}:await Envelope.genKeypair();
-      saveIdentity(id);
-      if(lk) db.ref(`vault/${S.room}/${S.uid}/priv`).remove().catch(()=>{});
-    }
-    S.myPriv=id.priv; S.pubs[S.uid]=id.pub;
-    // Republish the public half every session (idempotent; heals a wiped key node).
-    const pubSnap=await db.ref(`keys/${S.room}/${S.uid}/pub`).once('value');
-    if(pubSnap.val()!==id.pub) await db.ref(`keys/${S.room}/${S.uid}/pub`).set(id.pub);
-  }catch(e){console.error('initKeys failed',e);}
+      lp=s1.val(); lk=s2.val();
+    }catch(e){console.warn('legacy key lookup unavailable (rules not deployed?)',e);}
+    id=(lp&&lk)?{pub:lp,priv:lk}:await Envelope.genKeypair();
+    try{saveIdentity(id);}catch(e){console.warn('identity could not be saved locally',e);}
+    if(lk) db.ref(`vault/${S.room}/${S.uid}/priv`).remove().catch(()=>{});
+  }
+  // Keys are usable from here on — nothing below may block sending.
+  S.myPriv=id.priv; S.pubs[S.uid]=id.pub;
+  // Republish the public half (idempotent; heals a wiped key node). A rejection
+  // means database.rules.json is not deployed: nobody can encrypt to this
+  // device until it is, so surface that instead of failing silently.
+  db.ref(`keys/${S.room}/${S.uid}/pub`).once('value')
+    .then(s=>s.val()===id.pub?null:db.ref(`keys/${S.room}/${S.uid}/pub`).set(id.pub))
+    .catch(e=>{
+      console.error('public key publish failed',e);
+      toast('Public key rejected by database rules — publish database.rules.json','error');
+    });
   // Cache every member's public key; late joiners appear here too.
   const kRef=db.ref(`keys/${S.room}`);
   const onKey=snap=>{
@@ -389,7 +399,8 @@ const ACTION_FNS={
   closeBackup:()=>closeBackup(),
   backupExport:()=>backupExport(),
   backupPickFile:()=>$('backup-file').click(),
-  backupImport:()=>backupImport()
+  backupImport:()=>backupImport(),
+  toggleWatermark:(ev,el)=>toggleWatermark(el)
 };
 function runAction(e){
   const t=e.target, el=t&&t.closest?t.closest('[data-action]'):null;
@@ -952,7 +963,12 @@ async function handleSend(){
       clearDestruct(); clearReply();
     }
     $('msg-input').value=''; $('msg-input').style.height='auto';
-  }catch(e){toast(e&&e.message==='keys not ready'?'Encryption keys still loading — retry in a moment':'Send failed','error');console.error(e);}
+  }catch(e){
+    const denied=/permission/i.test((e&&e.message)||'')||(e&&e.code==='PERMISSION_DENIED');
+    toast(e&&e.message==='keys not ready'?'Encryption keys still loading — retry in a moment'
+      :denied?'Blocked by database rules — publish database.rules.json first':'Send failed','error');
+    console.error(e);
+  }
   $('btn-send').disabled=false; $('msg-input').focus();
 }
 
@@ -1624,6 +1640,7 @@ function hideAllRevealed(){
   }
 }
 function buildWatermark(){
+  if(!S.wmOn){stopWatermark();return;}
   const el=$('watermark-layer'); if(!el||!S.room)return;
   // Attribution only — the room code is deliberately NOT included: a screenshot
   // must not hand the room code to whoever sees the image.
@@ -1639,6 +1656,12 @@ function buildWatermark(){
   el.appendChild(frag); el.classList.add('on');
 }
 function stopWatermark(){ $('watermark-layer')?.classList.remove('on'); }
+function toggleWatermark(el){
+  S.wmOn=!!el.checked;
+  try{localStorage.setItem('vc_wm',S.wmOn?'1':'0');}catch(e){}
+  if(S.wmOn&&chatActive()&&S.room)buildWatermark(); else stopWatermark();
+  toast(S.wmOn?'Identity watermark on':'Identity watermark off','info');
+}
 function curtainOn(){
   if(!chatActive()||S.curtainOn)return;
   S.curtainOn=true;
