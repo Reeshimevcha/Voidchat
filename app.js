@@ -56,17 +56,74 @@ function toast(msg, type='info') {
 function copyText(text){ navigator.clipboard.writeText(text).then(()=>toast('Copied!','success')); }
 function showScreen(id){ document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); const s=$(id); if(s)s.classList.add('active'); }
 
-document.addEventListener('DOMContentLoaded', async()=>{
-  initLanding(); initChat(); initEmojiPicker(); initAttachMenu(); initVoiceNote();
-  initSearch(); initCipherVisualizer(); initScreenProtection();
+// ── Connection diagnostics ────────────────────────────────────────────────
+// A bare "sign-in failed" toast cannot be acted on: the usual causes are a
+// hostname that is not allowlisted in Firebase, Anonymous sign-in being off,
+// or the page being opened as a file:// document. Say which one it is, show
+// the rejected hostname, and offer a retry instead of leaving a dead button.
+function authErrorMessage(e){
+  const code=(e&&e.code)||'';
+  if(location.protocol==='file:')
+    return 'This page is open from a file (file://), where Firebase sign-in cannot run. Serve it over http:// or https:// (GitHub Pages, Netlify, or a local server) instead of double-clicking index.html.';
+  const host=location.hostname||'this origin';
+  const map={
+    'auth/unauthorized-domain':`The domain ${host} is not authorised for Firebase Authentication. Add it in Firebase Console → Authentication → Settings → Authorized domains, then retry.`,
+    'auth/operation-not-allowed':'Anonymous sign-in is disabled. Enable it in Firebase Console → Authentication → Sign-in method → Anonymous, then retry.',
+    'auth/network-request-failed':'Firebase is unreachable. A firewall, VPN, proxy or ad-blocker is blocking identitytoolkit.googleapis.com — check the connection and retry.',
+    'auth/invalid-api-key':'The Firebase apiKey in firebase-config.js is invalid or restricted. Check the API key restrictions in Google Cloud Console.',
+    'auth/too-many-requests':'Too many sign-in attempts from this network. Wait a minute, then retry.',
+    'auth/app-deleted':'This Firebase project no longer exists. Check firebase-config.js.',
+    'auth/internal-error':'Firebase returned an internal error. Retry in a moment.'
+  };
+  return map[code]||`Sign-in failed${code?' ('+code+')':''}. Open the browser console for the full error, then retry.`;
+}
+function dbErrorMessage(e){
+  const code=(e&&e.code)||'';
+  const text=`${code} ${(e&&e.message)||''}`;
+  if(/PERMISSION_DENIED/i.test(text))
+    return 'The database rejected this request (PERMISSION_DENIED). Publish database.rules.json in Firebase Console → Realtime Database → Rules, then retry.';
+  if(/UNAVAILABLE|disconnected|network|offline/i.test(text))
+    return 'Cannot reach the Realtime Database. Check your connection (or VPN/firewall) and retry.';
+  if(/INVALID_URL|invalid.*url/i.test(text))
+    return 'The databaseURL in firebase-config.js is invalid. Copy it from Firebase Console → Realtime Database.';
+  return 'Database error: '+(code||(e&&e.message)||'unknown')+'. Open the browser console for details.';
+}
+function showConnError(msg){
+  const box=$('conn-error'), m=$('conn-error-msg');
+  if(!box||!m)return;
+  m.textContent=msg;
+  box.classList.remove('hidden');
+}
+function clearConnError(){
+  $('conn-error')?.classList.add('hidden');
+}
+async function connectFirebase(){
+  clearConnError();
   try{
     const cred=await auth.signInAnonymously();
     S.uid=cred.user.uid;
+    return true;
   }catch(e){
-    console.error(e);
-    toast('Cannot connect: sign-in failed','error');
-    return;   // no uid means every write would be rejected by the rules anyway
+    console.error('sign-in failed',e);
+    showConnError(authErrorMessage(e));
+    toast('Cannot connect','error');
+    return false;   // no uid means every write would be rejected by the rules anyway
   }
+}
+async function retryConnect(){
+  const btn=$('btn-retry-connect');
+  if(btn){btn.disabled=true;btn.textContent='CONNECTING…';}
+  const ok=await connectFirebase();
+  if(btn){btn.disabled=false;btn.textContent='RETRY CONNECTION';}
+  if(!ok)return;
+  toast('Connected','success');
+  await tryRestore();
+}
+
+document.addEventListener('DOMContentLoaded', async()=>{
+  initLanding(); initChat(); initEmojiPicker(); initAttachMenu(); initVoiceNote();
+  initSearch(); initCipherVisualizer(); initScreenProtection();
+  if(!await connectFirebase()) return;   // the landing banner explains why
   await tryRestore();
 });
 
@@ -112,53 +169,65 @@ function switchTab(t){
 }
 
 async function handleCreate(){
-  if(!S.uid){toast('Not connected','error');return;}
+  if(!S.uid){toast('Not connected — press RETRY CONNECTION','error');return;}
   const name=$('username-create').value.trim();
   if(!name){toast('Enter codename','error');return;}
   const tc=document.querySelector('.type-card.selected');
   const type=tc?tc.dataset.type:'duo';
   const maxUsers=type==='group'?($('max-unlimited').checked?0:parseInt($('max-users-val').value)||0):2;
   const sessMin=parseInt($('session-duration').value)||0;
-  // Never .set() over a code that is already in use — that would hijack a live room.
-  let code=null;
-  for(let i=0;i<5&&!code;i++){
-    const c=genCode();
-    if((await db.ref(`rooms/${c}/owner`).once('value')).val()===null) code=c;
+  try{
+    // Never .set() over a code that is already in use — that would hijack a live room.
+    let code=null;
+    for(let i=0;i<5&&!code;i++){
+      const c=genCode();
+      if((await db.ref(`rooms/${c}/owner`).once('value')).val()===null) code=c;
+    }
+    if(!code){toast('Could not allocate a channel code','error');return;}
+    S.name=name; S.isOwner=true; S.type=type; S.room=code; S.canDownload=true;
+    const expiresAt=sessMin>0?Date.now()+sessMin*60*1000:null; S.roomExpires=expiresAt;
+    await db.ref(`rooms/${S.room}`).set({type,maxUsers,owner:S.uid,created:Date.now(),expiresAt,closed:false});
+    await db.ref(`rooms/${S.room}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:true,myVisibleTo:null});
+    db.ref(`rooms/${S.room}/users/${S.uid}/online`).onDisconnect().set(false);
+    saveSess(); enterChat();
+  }catch(e){
+    console.error('create room failed',e);
+    S.room=null; S.name=null; S.isOwner=false;
+    toast(dbErrorMessage(e),'error');
   }
-  if(!code){toast('Could not allocate a channel code','error');return;}
-  S.name=name; S.isOwner=true; S.type=type; S.room=code; S.canDownload=true;
-  const expiresAt=sessMin>0?Date.now()+sessMin*60*1000:null; S.roomExpires=expiresAt;
-  await db.ref(`rooms/${S.room}`).set({type,maxUsers,owner:S.uid,created:Date.now(),expiresAt,closed:false});
-  await db.ref(`rooms/${S.room}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:true,myVisibleTo:null});
-  db.ref(`rooms/${S.room}/users/${S.uid}/online`).onDisconnect().set(false);
-  saveSess(); enterChat();
 }
 
 async function handleJoin(){
-  if(!S.uid){toast('Not connected','error');return;}
+  if(!S.uid){toast('Not connected — press RETRY CONNECTION','error');return;}
   const name=$('username-join').value.trim();
   const code=$('room-code-join').value.trim().toUpperCase();
   if(!name){toast('Enter codename','error');return;}
   if(!/^[A-Z2-9]{10}$/.test(code)){toast('Room code must be 10 chars','error');return;}
-  // Read the public fields one by one: the room node itself is not readable to non-members.
-  const base=`rooms/${code}`;
-  const [owner,closed,expiresAt,type,maxUsers]=await Promise.all(
-    ['owner','closed','expiresAt','type','maxUsers'].map(f=>db.ref(`${base}/${f}`).once('value').then(s=>s.val()))
-  );
-  if(owner===null){toast('Room not found','error');return;}
-  const kicked=(await db.ref(`${base}/users/${S.uid}/kicked`).once('value')).val();
-  if(kicked===true){toast('You were removed from this room','error');return;}
-  if(closed===true){toast('Room is closed','error');return;}
-  if(expiresAt&&Date.now()>expiresAt){toast('Room expired','error');return;}
-  if(maxUsers>0){
-    const us=await db.ref(`${base}/users`).once('value');
-    if(Object.values(us.val()||{}).filter(u=>u.online).length>=maxUsers){toast('Room full','error');return;}
+  try{
+    // Read the public fields one by one: the room node itself is not readable to non-members.
+    const base=`rooms/${code}`;
+    const [owner,closed,expiresAt,type,maxUsers]=await Promise.all(
+      ['owner','closed','expiresAt','type','maxUsers'].map(f=>db.ref(`${base}/${f}`).once('value').then(s=>s.val()))
+    );
+    if(owner===null){toast('Room not found','error');return;}
+    const kicked=(await db.ref(`${base}/users/${S.uid}/kicked`).once('value')).val();
+    if(kicked===true){toast('You were removed from this room','error');return;}
+    if(closed===true){toast('Room is closed','error');return;}
+    if(expiresAt&&Date.now()>expiresAt){toast('Room expired','error');return;}
+    if(maxUsers>0){
+      const us=await db.ref(`${base}/users`).once('value');
+      if(Object.values(us.val()||{}).filter(u=>u.online).length>=maxUsers){toast('Room full','error');return;}
+    }
+    S.name=name; S.isOwner=owner===S.uid; S.room=code; S.type=type;
+    S.canDownload=S.isOwner; S.roomExpires=expiresAt||null;
+    await db.ref(`${base}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:S.isOwner,myVisibleTo:null});
+    db.ref(`${base}/users/${S.uid}/online`).onDisconnect().set(false);
+    saveSess(); enterChat();
+  }catch(e){
+    console.error('join room failed',e);
+    S.room=null; S.name=null; S.isOwner=false;
+    toast(dbErrorMessage(e),'error');
   }
-  S.name=name; S.isOwner=owner===S.uid; S.room=code; S.type=type;
-  S.canDownload=S.isOwner; S.roomExpires=expiresAt||null;
-  await db.ref(`${base}/users/${S.uid}`).set({name,online:true,joinedAt:Date.now(),canDownload:S.isOwner,myVisibleTo:null});
-  db.ref(`${base}/users/${S.uid}/online`).onDisconnect().set(false);
-  saveSess(); enterChat();
 }
 
 // ── Enter Chat ─────────────────────────────────────────────────────────────
@@ -401,6 +470,7 @@ const ACTION_FNS={
   backupExport:()=>backupExport(),
   backupPickFile:()=>$('backup-file').click(),
   backupImport:()=>backupImport(),
+  retryConnect:()=>retryConnect(),
   toggleWatermark:(ev,el)=>toggleWatermark(el)
 };
 function runAction(e){

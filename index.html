@@ -40,6 +40,15 @@
 
     <div class="land-card">
       <div class="card-line"></div>
+
+      <!-- Visible when anonymous sign-in or the database connection fails.
+           Shows the exact Firebase error + the host that was rejected. -->
+      <div id="conn-error" class="hidden conn-error" role="alert">
+        <div class="ce-title">⚠ NOT CONNECTED</div>
+        <div class="ce-msg" id="conn-error-msg"></div>
+        <button class="ce-retry" id="btn-retry-connect" data-action="retryConnect">RETRY CONNECTION</button>
+      </div>
+
       <div class="tabs">
         <button class="tab active" id="tab-create-btn">INITIALIZE</button>
         <button class="tab" id="tab-join-btn">CONNECT</button>
