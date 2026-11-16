@@ -654,7 +654,7 @@ mark{background:rgba(0,255,65,.25);color:var(--g1);border-radius:1px;padding:0 1
 .wm-cell{
   position:absolute;white-space:nowrap;transform:rotate(-22deg);
   font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1px;
-  color:rgba(0,255,65,.10);text-shadow:0 0 3px rgba(0,0,0,.6);
+  color:rgba(0,255,65,.035);text-shadow:0 0 3px rgba(0,0,0,.4);
 }
 @keyframes wm-drift{from{transform:translate(0,0)}to{transform:translate(-40px,-30px)}}
 
