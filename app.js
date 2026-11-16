@@ -292,7 +292,11 @@ async function initKeys(){
     const p=snap.child('pub').val(); if(!p)return;
     S.pubs[snap.key]=p; notePeerKey(snap.key,p); renderKeys();
   };
-  kRef.on('child_added',onKey);
+  const onKeyErr=e=>{
+    console.error('key directory unavailable',e);
+    toast('Encryption key directory blocked by database rules — publish database.rules.json','error');
+  };
+  kRef.on('child_added',onKey,onKeyErr);
   S.listeners.push(()=>kRef.off('child_added',onKey));
   renderKeys();
 }
@@ -1329,6 +1333,11 @@ async function toggleReveal(id){
     const cached=S.msgCache[id]||{};
     const plain=await decryptMsg({content:raw,wrapped:cached.wrapped,from:cached.from},id);
     el.classList.remove('decrypting');
+    if(plain==='🔒'){
+      el.classList.remove('revealed'); el.textContent=plain;
+      toast('Cannot decrypt: the sender\'s key is not published, or you were not a recipient when this message was sent','error');
+      return;
+    }
     el.textContent=plain; el.classList.add('revealed'); S.revealed.add(id);
     if(S.msgCache[id]) S.msgCache[id].plainText=plain;
     const btn=el.nextElementSibling; if(btn?.classList.contains('btn-reveal'))btn.textContent='🔒 HIDE';

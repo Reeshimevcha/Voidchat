@@ -52,16 +52,6 @@
           }
         },
 
-        "keys": {
-          ".read": "auth != null && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
-          "$uid": {
-            ".write": "auth != null && $uid === auth.uid && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
-            ".validate": "newData.hasChild('pub')",
-            "pub": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 1000" },
-            "$other": { ".validate": false }
-          }
-        },
-
         "messages": {
           ".read": "auth != null && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
 
@@ -121,6 +111,18 @@
         "candidates": {
           ".read": "auth != null && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
           ".write": "auth != null && root.child('rooms/' + $code + '/users/' + auth.uid).exists()"
+        }
+      }
+    },
+
+    "keys": {
+      "$code": {
+        ".read": "auth != null && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
+        "$uid": {
+          ".write": "auth != null && $uid === auth.uid && root.child('rooms/' + $code + '/users/' + auth.uid).exists()",
+          ".validate": "newData.hasChild('pub')",
+          "pub": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 1000" },
+          "$other": { ".validate": false }
         }
       }
     }
