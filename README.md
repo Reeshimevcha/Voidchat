@@ -89,7 +89,13 @@ to block it either. Voidchat therefore layers deterrence and attribution instead
 4. **Copy locks** — right-click, text selection and image drag-out of chat content
    are blocked. Casual deterrence only; DevTools bypasses this in seconds.
 
-Deliberately *not* implemented: PrintScreen key blocking and DevTools detection —
+PrintScreen (Windows/Linux) and Cmd+Shift+3/4/5 (macOS) are watched for: the page
+hides every revealed message and covers the UI the moment the shortcut is seen.
+That is still only a race — the OS can grab the frame before the page repaints,
+and **Android/iOS fire no event at all** for a hardware screenshot. Real blocking
+requires a native shell (Android `FLAG_SECURE`, macOS `NSWindow.sharingType`).
+
+Deliberately *not* implemented: DevTools detection —
 both are trivially bypassable and create false confidence. Real capture blocking
 needs a native wrapper (e.g. Electron `setContentProtection(true)` on Windows).
 

@@ -28,7 +28,7 @@ const S = {
   msgCache:{}, sendTimes:[],
   wmOn:(()=>{try{return localStorage.getItem('vc_wm')!=='0';}catch(e){return true;}})(),
   roomUsers:{},
-  curtainOn:false, curtainToastAt:0,
+  curtainOn:false, curtainToastAt:0, captureTimer:null,
 };
 
 const $ = id => document.getElementById(id);
@@ -1988,10 +1988,36 @@ function curtainOn(){
   if(!S.curtainToastAt||now-S.curtainToastAt>5000){ S.curtainToastAt=now; toast('⚠ Privacy curtain engaged — messages hidden'); }
 }
 function curtainOff(){ if(!S.curtainOn)return; S.curtainOn=false; $('privacy-curtain')?.classList.remove('on'); }
+// Best-effort screenshot deterrence. The OS captures the framebuffer below the
+// browser, so nothing here can guarantee a block — it races the grab by hiding
+// every revealed message the instant a capture shortcut is seen.
+function captureBlocked(){
+  if(!chatActive())return;
+  hideAllRevealed();
+  curtainOn();
+  const sub=document.querySelector('#privacy-curtain .pc-sub');
+  const prev=sub?sub.textContent:'';
+  if(sub)sub.textContent='Screenshot attempt detected — content hidden';
+  clearTimeout(S.captureTimer);
+  S.captureTimer=setTimeout(()=>{
+    if(sub)sub.textContent=prev;
+    if(document.hasFocus())curtainOff();
+  },1500);
+  toast('⚠ Screenshot attempt detected — messages hidden','error');
+}
 function initScreenProtection(){
   document.addEventListener('visibilitychange',()=>{ document.visibilityState==='hidden'?curtainOn():curtainOff(); });
   window.addEventListener('blur',curtainOn);
   window.addEventListener('focus',curtainOff);
+  // PrintScreen (Windows/Linux) and Cmd+Shift+3/4/5 (macOS). Android fires no
+  // event for a hardware screenshot, so only the focus curtain covers that.
+  document.addEventListener('keydown',e=>{
+    if(!chatActive())return;
+    const k=(e.key||'').toLowerCase();
+    const printKey=e.code==='PrintScreen'||k==='printscreen'||k==='snapshot';
+    const macShot=e.metaKey&&e.shiftKey&&['3','4','5'].includes(k);
+    if(printKey||macShot){ e.preventDefault(); captureBlocked(); }
+  });
   document.addEventListener('contextmenu',e=>{ if(chatActive()&&!e.target.closest('input,textarea'))e.preventDefault(); });
   document.addEventListener('copy',e=>{
     if(!chatActive())return;
