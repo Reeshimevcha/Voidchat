@@ -363,9 +363,10 @@ function renderKeys(){
   for(const[uid,u]of Object.entries(S.roomUsers)){
     if(!u||uid===S.uid)continue;
     const rec=S.trust[uid]||{};
-    const st=rec.pending?'changed':(rec.verified?'verified':'unverified');
-    const label=st==='verified'?'✓ VERIFIED':st==='changed'?'⚠ CHANGED':'○ UNVERIFIED';
-    const color=st==='verified'?'#00ff41':st==='changed'?'#ffaa00':'#446644';
+    const noKey=!S.pubs[uid];
+    const st=noKey?'nokey':(rec.pending?'changed':(rec.verified?'verified':'unverified'));
+    const label=st==='verified'?'✓ VERIFIED':st==='changed'?'⚠ CHANGED':st==='nokey'?'○ KEY NOT PUBLISHED':'○ UNVERIFIED';
+    const color=st==='verified'?'#00ff41':(st==='changed'||st==='nokey')?'#ffaa00':'#446644';
     const row=ce('div'); row.className='perm-row key-row';
     row.innerHTML=`<div class="pa" style="background:${avatarBg(u.name||'?')}">${avatarLetter(u.name||'?')}</div>
       <div class="pm"><span class="pn">${esc(u.name||'?')}</span><span class="priv-status" style="color:${color};font-size:9px;display:block">${label}</span></div>
@@ -378,7 +379,11 @@ function renderKeys(){
 async function openKeyModal(uid){
   if(!uid)return;
   const myPub=S.pubs[S.uid], theirPub=S.pubs[uid];
-  if(!myPub||!theirPub){toast('Keys not ready yet','error');return;}
+  if(!theirPub){
+    toast(`${peerName(uid)} has not published a key. The database rules must allow /keys — publish database.rules.json, then both reload`,'error');
+    return;
+  }
+  if(!myPub){toast('Your own key is still being generated — try again in a moment','error');return;}
   S.keyModalUid=uid;
   const rec=S.trust[uid]||{};
   const fp=await Envelope.fingerprint(theirPub);
